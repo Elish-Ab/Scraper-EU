@@ -79,3 +79,7 @@ def scrape_job(url: str = Query(..., description="Workable job URL")):
         return job_data
     except Exception as e:
         return {"error": str(e)}
+
+@app.get("/")
+def root():
+    return {"message": "Workable Job Scraper API. Use /scrape-links and /scrape-job endpoints."}
