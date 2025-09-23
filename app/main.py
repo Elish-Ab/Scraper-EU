@@ -3,14 +3,25 @@ from urllib.parse import urljoin
 from playwright.sync_api import sync_playwright
 import requests
 from bs4 import BeautifulSoup
-
+import re
 app = FastAPI()
 
 
 # --- Helper Functions ---
 
-def get_job_links(board_url: str):
-    """Scrape all job links from a Workable job board using Playwright."""
+def parse_posted_days(text: str) -> int:
+    """Convert 'Posted X days ago' into integer days."""
+    if not text:
+        return 9999
+    m = re.search(r"(\d+)\s+day", text)
+    if m:
+        return int(m.group(1))
+    if "hour" in text.lower():   # e.g. "Posted 3 hours ago"
+        return 0
+    return 9999
+
+def get_job_links(board_url: str, max_days: int = 5):
+    """Scrape job links from a Workable job board, filtering jobs posted in last `max_days` days."""
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         page = browser.new_page()
@@ -23,7 +34,16 @@ def get_job_links(board_url: str):
         links = []
 
         for item in job_items:
-            # Reliable selector: anchor with aria-labelledby
+            # Extract posted date
+            posted_el = item.query_selector("small[data-ui='job-posted']")
+            posted_text = posted_el.inner_text().strip() if posted_el else ""
+            days = parse_posted_days(posted_text)
+
+            # Stop if older than max_days
+            if days > max_days:
+                break
+
+            # Extract job link
             link_el = item.query_selector("a[aria-labelledby]")
             if link_el:
                 href = link_el.get_attribute("href")

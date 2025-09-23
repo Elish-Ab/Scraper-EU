@@ -2,6 +2,7 @@ from urllib.parse import urljoin
 from playwright.sync_api import sync_playwright
 import logging
 import requests
+import re
 
 # Configure logging
 logging.basicConfig(
@@ -11,22 +12,41 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-def get_job_links(board_url: str):
-    """Scrape all job links from a Workable job board using Playwright."""
+def parse_posted_days(text: str) -> int:
+    """Convert 'Posted X days ago' or 'Posted 1 day ago' into an integer."""
+    if not text:
+        return 9999
+    m = re.search(r"(\d+)\s+day", text)
+    if m:
+        return int(m.group(1))
+    if "hour" in text.lower():   # treat 'Posted X hours ago' as 0 days
+        return 0
+    return 9999
+
+def get_job_links(board_url: str, max_days: int = 5):
+    """Scrape job links posted within the last `max_days` days."""
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         page = browser.new_page()
-        logger.info(f"Opening board URL: {board_url}")
         page.goto(board_url, wait_until="networkidle")
 
-        logger.info("Waiting for job listings to load...")
+        # Wait for job listings
         page.wait_for_selector("li[data-ui='job-opening']")
 
         job_items = page.query_selector_all("li[data-ui='job-opening']")
-        logger.info(f"Found {len(job_items)} job items")
-
         links = []
+
         for item in job_items:
+            # Posted date text
+            posted_el = item.query_selector("small[data-ui='job-posted']")
+            posted_text = posted_el.inner_text().strip() if posted_el else ""
+            days = parse_posted_days(posted_text)
+
+            # Stop if older than max_days
+            if days > max_days:
+                break
+
+            # Job link
             link_el = item.query_selector("a[aria-labelledby]")
             if link_el:
                 href = link_el.get_attribute("href")
@@ -35,9 +55,7 @@ def get_job_links(board_url: str):
                     links.append(full_link)
 
         browser.close()
-        logger.info(f"Collected {len(links)} job links")
-        return list(set(links))
-
+        return list(set(links))  # deduplicate
 
 def fetch_job_details(job_url: str):
     try:
