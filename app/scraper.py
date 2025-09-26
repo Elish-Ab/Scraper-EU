@@ -1,9 +1,11 @@
+# app/scraper.py
 from urllib.parse import urljoin
 from playwright.sync_api import sync_playwright
 import logging
 import requests
 import re
-
+import datetime
+from datetime import datetime, timedelta
 # Configure logging
 logging.basicConfig(
     level=logging.DEBUG,  # use INFO in production
@@ -23,40 +25,118 @@ def parse_posted_days(text: str) -> int:
         return 0
     return 9999
 
-def get_job_links(board_url: str, max_days: int = 5):
-    """Scrape job links posted within the last `max_days` days."""
+
+MAX_DAYS = 5
+
+def fetch_from_api(board_url: str):
+    """Fetch jobs from Workable API using cursor pagination and cutoff by days."""
+    subdomain = board_url.strip("/").split("/")[-1]
+    api_url = f"https://apply.workable.com/api/v3/accounts/{subdomain}/jobs"
+
+    cutoff_date = datetime.utcnow() - timedelta(days=MAX_DAYS)
+    jobs = []
+
+    params = {"limit": 20}
+    while True:
+        resp = requests.get(api_url, params=params, timeout=15)
+        if resp.status_code != 200:
+            logger.debug(f"[API] Request failed: {resp.status_code}")
+            break
+
+        data = resp.json()
+        results = data.get("results", [])
+        if not results:
+            break
+
+        logger.debug(f"[API] Got {len(results)} jobs in this batch, total so far: {len(jobs)}")
+
+        stop = False
+        for job in results:
+            published = job.get("published")
+            if published:
+                pub_date = datetime.fromisoformat(published.replace("Z", "+00:00"))
+                if pub_date < cutoff_date:
+                    logger.debug(f"[API] Hit cutoff date at {pub_date}, stopping pagination.")
+                    stop = True
+                    break
+
+            shortcode = job.get("shortcode")
+            if shortcode:
+                full_link = urljoin(board_url, f"j/{shortcode}/")
+                jobs.append(full_link)
+
+        if stop:
+            break
+
+        # Follow pagination
+        next_page = data.get("nextPage")
+        if not next_page:
+            break
+        params = {"limit": 20, "nextPage": next_page}
+
+    return jobs
+
+
+def fetch_from_dom(board_url: str):
+    """Fallback DOM scraper with cutoff by days (for boards without API)."""
+    cutoff_date = datetime.utcnow() - timedelta(days=MAX_DAYS)
+    jobs = []
+
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         page = browser.new_page()
         page.goto(board_url, wait_until="networkidle")
 
-        # Wait for job listings
-        page.wait_for_selector("li[data-ui='job-opening']")
+        while True:
+            # Grab all job items currently loaded
+            job_items = page.query_selector_all("li[data-ui='job'], li[data-ui='job-opening']")
+            for item in job_items[len(jobs):]:
+                # Extract link
+                link_el = item.query_selector("a[aria-labelledby], a.styles--1OnOt")
+                posted_el = item.query_selector("[data-ui='job-posted']")
+                if not link_el or not posted_el:
+                    continue
 
-        job_items = page.query_selector_all("li[data-ui='job-opening']")
-        links = []
-
-        for item in job_items:
-            # Posted date text
-            posted_el = item.query_selector("small[data-ui='job-posted']")
-            posted_text = posted_el.inner_text().strip() if posted_el else ""
-            days = parse_posted_days(posted_text)
-
-            # Stop if older than max_days
-            if days > max_days:
-                break
-
-            # Job link
-            link_el = item.query_selector("a[aria-labelledby]")
-            if link_el:
                 href = link_el.get_attribute("href")
-                if href:
-                    full_link = urljoin(board_url, href)
-                    links.append(full_link)
+                text = posted_el.inner_text().strip()
+
+                # Check posted days
+                if "Posted" in text and "day" in text:
+                    try:
+                        days = int(text.split()[1])
+                        if days > MAX_DAYS:
+                            browser.close()
+                            return jobs  # stop when older than cutoff
+                    except Exception:
+                        pass
+
+                jobs.append(urljoin(board_url, href))
+
+            # Try clicking "Show more"
+            try:
+                show_more = page.query_selector("button[data-ui='load-more-button']")
+                if show_more:
+                    show_more.click()
+                    page.wait_for_timeout(1500)  # wait for jobs to load
+                    continue
+            except Exception:
+                pass
+            break
 
         browser.close()
-        return list(set(links))  # deduplicate
+    return jobs
 
+
+def get_job_links(board_url: str):
+    """General entry point: try API first, then fallback to DOM."""
+    try:
+        jobs = fetch_from_api(board_url)
+        if jobs:
+            return jobs
+    except Exception as e:
+        print(f"[DEBUG] API fetch failed: {e}")
+
+    return fetch_from_dom(board_url)
 def fetch_job_details(job_url: str):
     try:
         # Extract account slug and job id from the URL
