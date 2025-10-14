@@ -1,9 +1,8 @@
-# app/main.py - Complete Fixed Version with Working JSON API
+# app/main.py - Fixed Version with Correct Slug Handling
 from fastapi import FastAPI, Query
 from urllib.parse import urljoin
 from playwright.sync_api import sync_playwright
 import requests
-from bs4 import BeautifulSoup
 import datetime
 from datetime import datetime, timedelta
 import re
@@ -12,25 +11,20 @@ import logging
 app = FastAPI()
 
 # Configure logging
-logging.basicConfig(level=logging.DEBUG)
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-MAX_DAYS = 5
+MAX_DAYS = 30  # Increased to 30 days to catch more jobs
 
 # --- Helper Functions ---
 
-def extract_account_slug(board_url: str) -> str:
-    """Extract workable account slug (handles -dot- cases)."""
-    slug = board_url.strip("/").split("/")[-1]
-    # Replace "-dot-" with "."
-    slug = slug.replace("-dot-", ".")
-    return slug
-
 def try_json_api(board_url: str):
-    """Try to fetch from the JSON API that we know is working"""
+    """Try to fetch from the JSON API - uses ORIGINAL slug format"""
     try:
-        subdomain = extract_account_slug(board_url)
+        # Extract subdomain WITHOUT converting -dot- to .
+        subdomain = board_url.strip("/").split("/")[-1]
         api_url = f"https://apply.workable.com/api/v3/accounts/{subdomain}/jobs"
+        
         logger.info(f"Trying JSON API: {api_url}")
 
         cutoff_date = datetime.utcnow() - timedelta(days=MAX_DAYS)
@@ -38,50 +32,33 @@ def try_json_api(board_url: str):
 
         params = {"limit": 20}
         page_count = 0
-        max_pages = 20  # Safety limit
+        max_pages = 20
 
         while page_count < max_pages:
-            logger.debug(f"Fetching page {page_count + 1} from JSON API")
+            logger.info(f"Fetching page {page_count + 1} from JSON API")
+            
             resp = requests.get(api_url, params=params, headers={
                 "Accept": "application/json",
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
             }, timeout=15)
 
-            logger.debug(f"JSON API response: {resp.status_code}")
+            logger.info(f"JSON API response: {resp.status_code}")
 
             if resp.status_code != 200:
-                logger.debug(f"API failed with status {resp.status_code}: {resp.text[:200]}")
+                logger.warning(f"API failed with status {resp.status_code}")
                 break
 
             data = resp.json()
-            if "shortcode" in data and data.get("shortcode") == "Required":
-                logger.warning("JSON API is not available for this account. Falling back to DOM.")
-                return []
-
             results = data.get("results", [])
+            
             if not results:
-                logger.debug("No results in response")
+                logger.info("No results in response")
                 break
 
             logger.info(f"Found {len(results)} jobs in page {page_count + 1}")
 
             stop_pagination = False
             for job in results:
-                # --- Skip jobs that mention US or America in title/location ---
-                title = (job.get("title") or "").lower()
-                loc_obj = job.get("location") or {}
-                location_str = ""
-                if isinstance(loc_obj, dict):
-                    location_str = (loc_obj.get("country") or loc_obj.get("city") or "").lower()
-                else:
-                    location_str = str(loc_obj).lower()
-
-                if any(term in title for term in ["united states", "us", "america"]) or \
-                   any(term in location_str for term in ["united states", "us", "america"]):
-                    logger.info(f"Skipping US-based job: {job.get('title')}")
-                    continue
-                # --------------------------------------------------------------
-
                 published = job.get("published")
                 if published:
                     try:
@@ -107,7 +84,7 @@ def try_json_api(board_url: str):
 
             next_page = data.get("nextPage")
             if not next_page:
-                logger.debug("No nextPage found, ending pagination")
+                logger.info("No nextPage found, ending pagination")
                 break
 
             params = {"limit": 20, "nextPage": next_page}
@@ -121,20 +98,23 @@ def try_json_api(board_url: str):
         return []
 
 def get_job_links_dom_enhanced(board_url: str):
-    """Enhanced DOM scraper with better cookie and modal handling"""
+    """Enhanced DOM scraper - continues even if some jobs are old"""
     job_links = []
+    
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True)
             page = browser.new_page()
+            
             page.set_extra_http_headers({
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
             })
 
-            logger.debug(f"DOM: Navigating to: {board_url}")
+            logger.info(f"DOM: Navigating to: {board_url}")
             page.goto(board_url, wait_until="networkidle", timeout=30000)
             page.wait_for_timeout(3000)
 
+            # Handle cookie consent
             try:
                 cookie_selectors = [
                     "[data-ui='cookie-consent'] button",
@@ -147,16 +127,16 @@ def get_job_links_dom_enhanced(board_url: str):
                     if cookie_btn and cookie_btn.is_visible():
                         cookie_btn.click()
                         page.wait_for_timeout(1000)
-                        logger.debug("Dismissed cookie consent")
+                        logger.info("Dismissed cookie consent")
                         break
             except Exception as e:
-                logger.debug(f"Cookie handling failed: {e}")
+                logger.debug(f"Cookie handling: {e}")
 
+            # Find job elements
             job_selectors = [
                 "li[data-ui='job']",
                 "li[data-ui='job-opening']",
-                ".job-item",
-                "[data-testid*='job']"
+                ".job-item"
             ]
 
             all_jobs = []
@@ -164,12 +144,16 @@ def get_job_links_dom_enhanced(board_url: str):
                 try:
                     elements = page.query_selector_all(selector)
                     if elements:
-                        logger.debug(f"DOM: Found {len(elements)} elements with selector: {selector}")
+                        logger.info(f"DOM: Found {len(elements)} elements with selector: {selector}")
                         all_jobs = elements
                         break
                 except:
                     continue
 
+            # Process all found jobs
+            cutoff_date = datetime.utcnow() - timedelta(days=MAX_DAYS)
+            old_jobs_count = 0
+            
             for item in all_jobs:
                 try:
                     link_el = None
@@ -177,6 +161,7 @@ def get_job_links_dom_enhanced(board_url: str):
                         link_el = item.query_selector(link_selector)
                         if link_el:
                             break
+                    
                     if not link_el:
                         continue
 
@@ -184,80 +169,122 @@ def get_job_links_dom_enhanced(board_url: str):
                     if not href or '/j/' not in href:
                         continue
 
-                    # Skip by title
-                    title_el = item.query_selector("[data-ui='job-title']")
-                    title_txt = title_el.inner_text().strip().lower() if title_el else ""
-
-                    if any(term in title_txt for term in ["united states", "us", "america"]):
-                        logger.info(f"DOM: Skipping US job by title: {title_txt}")
-                        continue
-
-                    # Skip by location text if available
-                    loc_el = item.query_selector("[data-ui='job-location']")
-                    loc_txt = loc_el.inner_text().strip().lower() if loc_el else ""
-                    if any(term in loc_txt for term in ["united states", "us", "america"]):
-                        logger.info(f"DOM: Skipping US job by location: {loc_txt}")
-                        continue
-
-                    # Check posting date if possible
+                    # Check posting date
                     posted_el = item.query_selector("[data-ui='job-posted']")
                     if posted_el:
                         text = posted_el.inner_text().strip()
-                        if "Posted" in text:
+                        if "Posted" in text and "day" in text:
                             m = re.search(r"(\d+)\s+day", text)
                             if m:
                                 days = int(m.group(1))
                                 if days > MAX_DAYS:
-                                    logger.debug(f"DOM: Found job older than {MAX_DAYS} days: {days} days. Stopping.")
-                                    browser.close()
-                                    return list(set(job_links))
+                                    old_jobs_count += 1
+                                    logger.debug(f"DOM: Skipping job older than {MAX_DAYS} days: {days} days")
+                                    # Don't stop, just skip this job
+                                    continue
 
                     full_url = urljoin(board_url, href)
                     if full_url not in job_links:
                         job_links.append(full_url)
                         logger.debug(f"DOM: Found job link: {full_url}")
+                        
                 except Exception as e:
                     logger.debug(f"DOM: Error processing job item: {e}")
                     continue
 
-            # Show more logic stays unchanged...
-            # (you can keep your existing show-more loop here)
+            logger.info(f"DOM: Processed {len(all_jobs)} jobs, found {len(job_links)} valid, skipped {old_jobs_count} old")
 
+            # Try to click "Show more" to get additional jobs
+            attempts = 0
+            max_attempts = 5
+            
+            while attempts < max_attempts:
+                try:
+                    page.wait_for_timeout(2000)
+                    
+                    show_more = page.query_selector("button[data-ui='load-more-button']")
+                    
+                    if not show_more or not show_more.is_visible():
+                        logger.info("DOM: No more 'Show more' button found")
+                        break
+                    
+                    logger.info(f"DOM: Clicking 'Show more' button (attempt {attempts + 1})")
+                    
+                    # Dismiss overlays first
+                    try:
+                        backdrop = page.query_selector("[data-ui='backdrop']")
+                        if backdrop:
+                            backdrop.click(force=True)
+                            page.wait_for_timeout(500)
+                    except:
+                        pass
+                    
+                    show_more.click(force=True)
+                    page.wait_for_timeout(3000)
+                    
+                    # Process new jobs
+                    new_jobs = page.query_selector_all("li[data-ui='job'], li[data-ui='job-opening']")
+                    if len(new_jobs) > len(all_jobs):
+                        logger.info(f"DOM: Loaded {len(new_jobs) - len(all_jobs)} more jobs")
+                        
+                        for item in new_jobs[len(all_jobs):]:
+                            try:
+                                link_el = item.query_selector("a[aria-labelledby], a")
+                                if link_el:
+                                    href = link_el.get_attribute("href")
+                                    if href and '/j/' in href:
+                                        full_url = urljoin(board_url, href)
+                                        if full_url not in job_links:
+                                            job_links.append(full_url)
+                                            logger.debug(f"DOM: Found additional job: {full_url}")
+                            except:
+                                continue
+                        
+                        all_jobs = new_jobs
+                        attempts += 1
+                    else:
+                        logger.info("DOM: No new jobs loaded, stopping")
+                        break
+                        
+                except Exception as e:
+                    logger.debug(f"DOM: Error with 'Show more' (attempt {attempts + 1}): {e}")
+                    attempts += 1
+                    break
+            
             browser.close()
-
+            
     except Exception as e:
         logger.error(f"DOM scraping failed: {e}")
-
+    
     return list(set(job_links))
 
 def get_job_links(board_url: str):
-    """Main function to get job links - tries JSON API first, then DOM"""
+    """Main function - tries JSON API first, then DOM"""
     logger.info(f"Starting job link extraction for: {board_url}")
+    
     links = try_json_api(board_url)
     if links:
         logger.info(f"Successfully got {len(links)} links from JSON API")
         return links
+    
     logger.info("JSON API failed, trying DOM scraping")
     links = get_job_links_dom_enhanced(board_url)
     logger.info(f"DOM scraping found {len(links)} links")
+    
     return links
 
-
 def fetch_job_details(job_url: str):
-    """Fetch details of a single job posting from Workable API"""
+    """Fetch details of a single job - uses ORIGINAL slug format"""
     try:
         parts = job_url.strip("/").split("/")
         if len(parts) < 2:
             raise ValueError("Invalid job URL format")
             
-        account = parts[-3]  # e.g. infatica-dot-i-o
+        account = parts[-3]  # e.g. infatica-dot-i-o (keep original)
         job_id = parts[-1]   # e.g. 5F1B56C10C
         
-        # Convert account slug back for API call
-        api_account = account.replace("-dot-", ".")
-        
-        # Try the public job detail API
-        api_url = f"https://apply.workable.com/api/v2/accounts/{api_account}/jobs/{job_id}"
+        # Keep original account format (don't convert)
+        api_url = f"https://apply.workable.com/api/v2/accounts/{account}/jobs/{job_id}"
         
         logger.debug(f"Fetching job details from: {api_url}")
         
@@ -269,7 +296,7 @@ def fetch_job_details(job_url: str):
         if resp.status_code == 200:
             return resp.json()
         else:
-            logger.debug(f"Job detail API failed with status {resp.status_code}")
+            logger.warning(f"Job detail API failed with status {resp.status_code}")
             return {
                 "job": {
                     "jobId": job_id,
@@ -280,7 +307,7 @@ def fetch_job_details(job_url: str):
             }
             
     except Exception as e:
-        logger.error(f"Error fetching job details for {job_url}: {e}")
+        logger.error(f"Error fetching job details: {e}")
         return {
             "job": {
                 "jobId": job_url.split("/")[-1] if "/" in job_url else "unknown",
@@ -294,6 +321,7 @@ def fetch_job_details(job_url: str):
 
 @app.get("/scrape-links")
 def scrape_links(url: str = Query(..., description="Workable job board URL")):
+    """Get job links from a Workable board"""
     try:
         links = get_job_links(url)
         return {"count": len(links), "links": links}
@@ -303,6 +331,7 @@ def scrape_links(url: str = Query(..., description="Workable job board URL")):
 
 @app.get("/scrape-job")
 def scrape_job(url: str = Query(..., description="Workable job URL")):
+    """Get details for a specific job"""
     try:
         job_data = fetch_job_details(url)
         return job_data
@@ -312,9 +341,10 @@ def scrape_job(url: str = Query(..., description="Workable job URL")):
 
 @app.get("/scrape-all-jobs")
 def scrape_all_jobs(url: str = Query(..., description="Workable job board URL")):
-    """Get all job details in one call using JSON API with fallback to DOM"""
+    """Get all job details using JSON API with pagination"""
     try:
-        subdomain = extract_account_slug(url)
+        # Extract subdomain WITHOUT converting -dot- to .
+        subdomain = url.strip("/").split("/")[-1]
         api_url = f"https://apply.workable.com/api/v3/accounts/{subdomain}/jobs"
         
         logger.info(f"Scraping all jobs from: {api_url}")
@@ -322,7 +352,6 @@ def scrape_all_jobs(url: str = Query(..., description="Workable job board URL"))
         cutoff_date = datetime.utcnow() - timedelta(days=MAX_DAYS)
         all_jobs = []
         
-        # Start with first page
         params = {"limit": 20}
         page_count = 0
         max_pages = 20
@@ -330,7 +359,7 @@ def scrape_all_jobs(url: str = Query(..., description="Workable job board URL"))
         while page_count < max_pages:
             resp = requests.get(api_url, params=params, headers={
                 "Accept": "application/json",
-                "User-Agent": "Mozilla/5.0"
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
             }, timeout=15)
 
             if resp.status_code != 200:
@@ -338,18 +367,14 @@ def scrape_all_jobs(url: str = Query(..., description="Workable job board URL"))
                 break
 
             data = resp.json()
-
-            # Add fallback check here
-            if "shortcode" in data and data.get("shortcode") == "Required":
-                logger.warning("API returned 'shortcode required', falling back to DOM")
-                break
-
             results = data.get("results", [])
+            
             if not results:
                 break
 
             logger.info(f"Processing page {page_count + 1} with {len(results)} jobs")
 
+            stop_pagination = False
             for job in results:
                 published = job.get("published")
                 if published:
@@ -357,13 +382,8 @@ def scrape_all_jobs(url: str = Query(..., description="Workable job board URL"))
                         pub_date = datetime.fromisoformat(published.replace("Z", "+00:00"))
                         if pub_date < cutoff_date:
                             logger.info(f"Cutoff date hit at {pub_date}")
-                            return {
-                                "success": True,
-                                "total": len(all_jobs),
-                                "jobs": all_jobs,
-                                "api_endpoint": api_url,
-                                "pages_processed": page_count + 1
-                            }
+                            stop_pagination = True
+                            break
                     except Exception as e:
                         logger.debug(f"Date parsing error: {e}")
 
@@ -381,6 +401,9 @@ def scrape_all_jobs(url: str = Query(..., description="Workable job board URL"))
                     "url": urljoin(url, f"j/{job.get('shortcode')}/") if job.get("shortcode") else None
                 })
 
+            if stop_pagination:
+                break
+
             next_page = data.get("nextPage")
             if not next_page:
                 break
@@ -397,7 +420,7 @@ def scrape_all_jobs(url: str = Query(..., description="Workable job board URL"))
                 "pages_processed": page_count + 1
             }
 
-        # fallback if no jobs
+        # Fallback to DOM if API returns nothing
         logger.info("Falling back to DOM parsing")
         links = get_job_links_dom_enhanced(url)
         return {
@@ -413,16 +436,14 @@ def scrape_all_jobs(url: str = Query(..., description="Workable job board URL"))
 
 @app.get("/test-api-endpoints")
 def test_api_endpoints(url: str = Query(..., description="Workable job board URL")):
-    """Test different API endpoints to see which ones work"""
-    subdomain = extract_account_slug(url)
+    """Test different API endpoints"""
+    # Extract subdomain WITHOUT converting
+    subdomain = url.strip("/").split("/")[-1]
     
     endpoints_to_test = [
         f"https://apply.workable.com/api/v3/accounts/{subdomain}/jobs",
         f"https://apply.workable.com/api/v2/accounts/{subdomain}/jobs",
         f"https://apply.workable.com/api/v1/accounts/{subdomain}/jobs",
-        f"https://apply.workable.com/api/v1/widget/accounts/{subdomain}",
-        f"https://apply.workable.com/{subdomain}.json",
-        f"https://apply.workable.com/{subdomain}/jobs.json"
     ]
     
     results = []
@@ -437,35 +458,26 @@ def test_api_endpoints(url: str = Query(..., description="Workable job board URL
             result = {
                 "endpoint": endpoint,
                 "status_code": resp.status_code,
-                "success": resp.status_code == 200,
-                "content_type": resp.headers.get("content-type", ""),
-                "response_size": len(resp.text),
-                "has_results": False,
-                "results_count": 0,
-                "has_next_page": False,
-                "sample_data": {}
+                "success": resp.status_code == 200
             }
             
             if resp.status_code == 200:
                 try:
                     data = resp.json()
-                    if isinstance(data, dict):
-                        # Check for different data structures
-                        if "results" in data:
-                            result["has_results"] = True
-                            result["results_count"] = len(data.get("results", []))
-                            result["has_next_page"] = "nextPage" in data
-                            if data.get("results"):
-                                result["sample_data"] = {k: v for k, v in list(data.get("results", [{}]))[0].items() if k in ["id", "title", "shortcode", "published"]}
-                        elif "jobs" in data:
-                            result["has_results"] = True
-                            result["results_count"] = len(data.get("jobs", []))
-                            if data.get("jobs"):
-                                result["sample_data"] = {k: v for k, v in list(data.get("jobs", [{}]))[0].items() if k in ["id", "title", "shortcode", "published"]}
-                        else:
-                            result["sample_data"] = {k: v for k, v in list(data.items())[:3]}
-                except:
-                    result["response_preview"] = resp.text[:200]
+                    if "results" in data:
+                        result["has_results"] = True
+                        result["results_count"] = len(data.get("results", []))
+                        result["has_next_page"] = "nextPage" in data
+                        if data.get("results"):
+                            sample = data.get("results", [{}])[0]
+                            result["sample_data"] = {
+                                "id": sample.get("id"),
+                                "title": sample.get("title"),
+                                "shortcode": sample.get("shortcode"),
+                                "published": sample.get("published")
+                            }
+                except Exception as e:
+                    result["error"] = str(e)
             
             results.append(result)
             
@@ -487,18 +499,15 @@ def test_api_endpoints(url: str = Query(..., description="Workable job board URL
 @app.get("/")
 def root():
     return {
-        "message": "Workable Job Scraper API - Complete JSON API Version", 
+        "message": "Workable Job Scraper API - Fixed JSON API Version", 
         "endpoints": {
-            "/scrape-links": "Get job links using JSON API with pagination fallback to DOM",
+            "/scrape-links": "Get job links (JSON API with DOM fallback)",
             "/scrape-job": "Get details for a specific job",
-            "/scrape-all-jobs": "Get all job details using JSON API with pagination",
-            "/test-api-endpoints": "Test which API endpoints work for a given board"
+            "/scrape-all-jobs": "Get all job details with pagination",
+            "/test-api-endpoints": "Test which API endpoints work"
         },
-        "features": [
-            "Primary: JSON API with nextPage pagination support",
-            "Fallback: Enhanced DOM scraping with Show More handling", 
-            "Date-based filtering (last 5 days)",
-            "Cookie consent and modal handling",
-            "Force click for stubborn Show More buttons"
-        ]
+        "config": {
+            "max_days": MAX_DAYS,
+            "note": "Uses original slug format (keeps -dot- instead of converting to .)"
+        }
     }
