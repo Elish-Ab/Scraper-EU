@@ -1,12 +1,13 @@
 # app/main.py - Fixed Version with Correct Slug Handling
 from fastapi import FastAPI, Query
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 from playwright.sync_api import sync_playwright
 import requests
 import datetime
 from datetime import datetime, timedelta
 import re
 import logging
+import json
 
 app = FastAPI()
 
@@ -273,39 +274,168 @@ def get_job_links(board_url: str):
     
     return links
 
-def fetch_job_details(job_url: str):
-    """Fetch details of a single job - uses ORIGINAL slug format"""
+# ---------------- NEW: robust URL parsing + hardened fetch ---------------- #
+
+def _parse_workable_url(job_url: str):
+    """
+    Works for:
+    - https://apply.workable.com/<account>/j/<shortcode>/
+    - https://apply.workable.com/<account>/j/<shortcode>
+    - /<account>/j/<shortcode>/
+    - <account>/j/<shortcode>
+    """
+    u = urlparse(job_url)
+    path = u.path if u.path else job_url  # allow bare path input
+    parts = [p for p in path.strip("/").split("/") if p]
+
+    # find the "j" marker defensively
     try:
-        parts = job_url.strip("/").split("/")
-        if len(parts) < 2:
-            raise ValueError("Invalid job URL format")
-            
-        account = parts[-3]  # e.g. infatica-dot-i-o (keep original)
-        job_id = parts[-1]   # e.g. 5F1B56C10C
-        
-        # Keep original account format (don't convert)
-        api_url = f"https://apply.workable.com/api/v2/accounts/{account}/jobs/{job_id}"
-        
-        logger.debug(f"Fetching job details from: {api_url}")
-        
-        resp = requests.get(api_url, headers={
-            "Accept": "application/json",
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-        }, timeout=15)
-        
+        j_idx = len(parts) - 1 - parts[::-1].index("j")
+        account = parts[j_idx - 1]
+        shortcode = parts[j_idx + 1]
+        return account, shortcode
+    except Exception:
+        # Last-resort heuristic for ".../j/<shortcode>"
+        if len(parts) >= 3 and parts[-2] == "j":
+            return parts[-3], parts[-1]
+        raise ValueError(f"Cannot parse Workable URL: {job_url}")
+
+def _browsery_headers(job_url: str):
+    return {
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": job_url,
+        "Origin": "https://apply.workable.com",
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        ),
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+    }
+
+def fetch_job_details(job_url: str):
+    """Fetch details of a single job; robust parsing, headers, and fallbacks."""
+    try:
+        account, shortcode = _parse_workable_url(job_url)
+        v2_url = f"https://apply.workable.com/api/v2/accounts/{account}/jobs/{shortcode}"
+        headers = _browsery_headers(job_url)
+
+        # --- Primary: v2 detail endpoint ---
+        resp = requests.get(v2_url, headers=headers, timeout=15)
         if resp.status_code == 200:
             return resp.json()
         else:
-            logger.warning(f"Job detail API failed with status {resp.status_code}")
+            logger.warning(f"v2 job detail failed {resp.status_code}: {resp.text[:200]}")
+
+        # --- Fallback #1: v3 listing; match the shortcode ---
+        v3_url = f"https://apply.workable.com/api/v3/accounts/{account}/jobs"
+        params = {"limit": 20}
+        seen_pages = set()
+        while True:
+            r = requests.get(v3_url, headers=headers, params=params, timeout=15)
+            if r.status_code != 200:
+                logger.warning(f"v3 list failed {r.status_code}: {r.text[:200]}")
+                break
+            data = r.json()
+            for job in data.get("results", []):
+                if job.get("shortcode") == shortcode:
+                    return {
+                        "job": {
+                            "jobId": shortcode,
+                            "url": job_url,
+                            "status": "ok",
+                            "account": account,
+                            "title": job.get("title"),
+                            "department": job.get("department"),
+                            "published": job.get("published"),
+                            "location": job.get("location"),
+                            "locations": job.get("locations"),
+                            "type": job.get("type"),
+                            "workplace": job.get("workplace"),
+                            "remote": job.get("remote"),
+                            "source": "v3_fallback"
+                        }
+                    }
+            nextp = data.get("nextPage")
+            if not nextp or nextp in seen_pages:
+                break
+            seen_pages.add(nextp)
+            params = {"limit": 20, "nextPage": nextp}
+
+        # --- Fallback #2: DOM scrape (JSON-LD first) ---
+        try:
+            with sync_playwright() as p:
+                browser = p.chromium.launch(headless=True)
+                page = browser.new_page(extra_http_headers={"User-Agent": headers["User-Agent"]})
+                page.goto(job_url, wait_until="networkidle", timeout=35000)
+                page.wait_for_timeout(1500)
+
+                # JSON-LD
+                script = page.query_selector('script[type="application/ld+json"]')
+                if script:
+                    try:
+                        ld_raw = script.inner_text()
+                        ld = json.loads(ld_raw)
+                    except Exception:
+                        ld = None
+
+                    if isinstance(ld, dict):
+                        title = ld.get("title") or ld.get("name")
+                        desc = ld.get("description")
+                        hiring_org = None
+                        jo = ld.get("hiringOrganization")
+                        if isinstance(jo, dict):
+                            hiring_org = jo.get("name")
+
+                        job_loc = None
+                        jl = ld.get("jobLocation")
+                        if isinstance(jl, list) and jl:
+                            job_loc = (jl[0].get("address") or {}).get("addressLocality") if isinstance(jl[0], dict) else None
+                        elif isinstance(jl, dict):
+                            job_loc = (jl.get("address") or {}).get("addressLocality")
+
+                        browser.close()
+                        return {
+                            "job": {
+                                "jobId": shortcode,
+                                "url": job_url,
+                                "status": "ok",
+                                "account": account,
+                                "title": title,
+                                "company": hiring_org,
+                                "location_hint": job_loc,
+                                "description_snippet": (desc[:500] + "…") if isinstance(desc, str) and len(desc) > 500 else desc,
+                                "source": "dom_jsonld"
+                            }
+                        }
+
+                # Minimal fallback: page title
+                title = page.title()
+                browser.close()
+                return {
+                    "job": {
+                        "jobId": shortcode,
+                        "url": job_url,
+                        "status": "ok",
+                        "account": account,
+                        "title": title,
+                        "source": "dom_title_only"
+                    }
+                }
+        except Exception as e2:
+            logger.warning(f"DOM fallback failed: {e2}")
             return {
                 "job": {
-                    "jobId": job_id,
+                    "jobId": shortcode,
                     "url": job_url,
                     "status": "limited_info",
-                    "account": account
+                    "account": account,
+                    "reason": f"v2_non_200, v3/DOM error: {str(e2)}"
                 }
             }
-            
+
     except Exception as e:
         logger.error(f"Error fetching job details: {e}")
         return {
