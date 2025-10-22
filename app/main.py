@@ -316,55 +316,131 @@ def _browsery_headers(job_url: str):
     }
 
 def fetch_job_details(job_url: str):
-    """Fetch details of a single job; robust parsing, headers, and fallbacks."""
+    """
+    Fetch details of a single Workable job.
+
+    Order of attempts:
+      1) v3 detail:  https://apply.workable.com/api/v3/accounts/{account}/jobs/{shortcode}
+      2) v2 detail:  https://apply.workable.com/api/v2/accounts/{account}/jobs/{shortcode}
+      3) v3 list:    https://apply.workable.com/api/v3/accounts/{account}/jobs (scan for shortcode)
+      4) DOM fallback: JSON-LD on the job page (and finally page title)
+
+    Depends on helpers already in your code:
+      - _parse_workable_url(job_url) -> (account, shortcode)
+      - _browsery_headers(job_url)   -> headers dict
+    """
     try:
         account, shortcode = _parse_workable_url(job_url)
-        v2_url = f"https://apply.workable.com/api/v2/accounts/{account}/jobs/{shortcode}"
-        headers = _browsery_headers(job_url)
+        v3_detail = f"https://apply.workable.com/api/v3/accounts/{account}/jobs/{shortcode}"
+        v2_detail = f"https://apply.workable.com/api/v2/accounts/{account}/jobs/{shortcode}"
+        v3_list   = f"https://apply.workable.com/api/v3/accounts/{account}/jobs"
+        headers   = _browsery_headers(job_url)
 
-        # --- Primary: v2 detail endpoint ---
-        resp = requests.get(v2_url, headers=headers, timeout=15)
-        if resp.status_code == 200:
-            return resp.json()
-        else:
-            logger.warning(f"v2 job detail failed {resp.status_code}: {resp.text[:200]}")
-
-        # --- Fallback #1: v3 listing; match the shortcode ---
-        v3_url = f"https://apply.workable.com/api/v3/accounts/{account}/jobs"
-        params = {"limit": 20}
-        seen_pages = set()
-        while True:
-            r = requests.get(v3_url, headers=headers, params=params, timeout=15)
-            if r.status_code != 200:
-                logger.warning(f"v3 list failed {r.status_code}: {r.text[:200]}")
-                break
-            data = r.json()
-            for job in data.get("results", []):
-                if job.get("shortcode") == shortcode:
-                    return {
-                        "job": {
-                            "jobId": shortcode,
-                            "url": job_url,
-                            "status": "ok",
-                            "account": account,
-                            "title": job.get("title"),
-                            "department": job.get("department"),
-                            "published": job.get("published"),
-                            "location": job.get("location"),
-                            "locations": job.get("locations"),
-                            "type": job.get("type"),
-                            "workplace": job.get("workplace"),
-                            "remote": job.get("remote"),
-                            "source": "v3_fallback"
-                        }
+        # --- Primary: v3 detail endpoint (rich payload incl. description/requirements/benefits) ---
+        try:
+            resp = requests.get(v3_detail, headers=headers, timeout=15)
+            if resp.status_code == 200:
+                d = resp.json()
+                return {
+                    "job": {
+                        "jobId": d.get("shortcode") or shortcode,
+                        "id": d.get("id"),
+                        "url": job_url,
+                        "status": "ok",
+                        "account": account,
+                        "title": d.get("title"),
+                        "department": d.get("department"),
+                        "published": d.get("published"),
+                        "location": d.get("location"),
+                        "locations": d.get("locations"),
+                        "type": d.get("type"),
+                        "workplace": d.get("workplace"),
+                        "remote": d.get("remote"),
+                        "approvalStatus": d.get("approvalStatus"),
+                        "description_html": d.get("description"),
+                        "requirements_html": d.get("requirements"),
+                        "benefits_html": d.get("benefits"),
+                        "language": d.get("language"),
+                        "state": d.get("state"),
+                        "isInternal": d.get("isInternal"),
+                        "source": "v3_detail",
                     }
-            nextp = data.get("nextPage")
-            if not nextp or nextp in seen_pages:
-                break
-            seen_pages.add(nextp)
-            params = {"limit": 20, "nextPage": nextp}
+                }
+            logger.warning(f"v3 job detail failed {resp.status_code}: {resp.text[:200]}")
+        except Exception as e:
+            logger.warning(f"v3 job detail request error: {e}")
 
-        # --- Fallback #2: DOM scrape (JSON-LD first) ---
+        # --- Fallback #1: v2 detail endpoint (older tenants) ---
+        try:
+            resp = requests.get(v2_detail, headers=headers, timeout=15)
+            if resp.status_code == 200:
+                d = resp.json()
+                return {
+                    "job": {
+                        "jobId": shortcode,
+                        "url": job_url,
+                        "status": "ok",
+                        "account": account,
+                        "title": d.get("title"),
+                        "department": d.get("department"),
+                        "published": d.get("published"),
+                        "location": d.get("location"),
+                        "locations": d.get("locations"),
+                        "type": d.get("type"),
+                        "workplace": d.get("workplace"),
+                        "remote": d.get("remote"),
+                        "description_html": d.get("description"),
+                        "requirements_html": d.get("requirements"),
+                        "benefits_html": d.get("benefits"),
+                        "source": "v2_detail",
+                    }
+                }
+            logger.warning(f"v2 job detail failed {resp.status_code}: {resp.text[:200]}")
+        except Exception as e:
+            logger.warning(f"v2 job detail request error: {e}")
+
+        # --- Fallback #2: v3 listing; scan pages for matching shortcode ---
+        try:
+            params = {"limit": 20}
+            seen_pages = set()
+            while True:
+                r = requests.get(v3_list, headers=headers, params=params, timeout=15)
+                if r.status_code != 200:
+                    logger.warning(f"v3 list failed {r.status_code}: {r.text[:200]}")
+                    break
+                data = r.json()
+                for job in data.get("results", []):
+                    if job.get("shortcode") == shortcode:
+                        return {
+                            "job": {
+                                "jobId": shortcode,
+                                "id": job.get("id"),
+                                "url": job_url,
+                                "status": "ok",
+                                "account": account,
+                                "title": job.get("title"),
+                                "department": job.get("department"),
+                                "published": job.get("published"),
+                                "location": job.get("location"),
+                                "locations": job.get("locations"),
+                                "type": job.get("type"),
+                                "workplace": job.get("workplace"),
+                                "remote": job.get("remote"),
+                                "language": job.get("language"),
+                                "state": job.get("state"),
+                                "isInternal": job.get("isInternal"),
+                                "source": "v3_list_match",
+                            }
+                        }
+                nextp = data.get("nextPage")
+                if not nextp or nextp in seen_pages:
+                    break
+                seen_pages.add(nextp)
+                params = {"limit": 20, "nextPage": nextp}
+        except Exception as e:
+            logger.warning(f"v3 list fallback error: {e}")
+
+        # --- Fallback #3: DOM scrape (JSON-LD first, then page title) ---
         try:
             with sync_playwright() as p:
                 browser = p.chromium.launch(headless=True)
@@ -372,7 +448,7 @@ def fetch_job_details(job_url: str):
                 page.goto(job_url, wait_until="networkidle", timeout=35000)
                 page.wait_for_timeout(1500)
 
-                # JSON-LD
+                # Try JSON-LD block
                 script = page.query_selector('script[type="application/ld+json"]')
                 if script:
                     try:
@@ -392,9 +468,14 @@ def fetch_job_details(job_url: str):
                         job_loc = None
                         jl = ld.get("jobLocation")
                         if isinstance(jl, list) and jl:
-                            job_loc = (jl[0].get("address") or {}).get("addressLocality") if isinstance(jl[0], dict) else None
+                            if isinstance(jl[0], dict):
+                                addr = jl[0].get("address") or {}
+                                if isinstance(addr, dict):
+                                    job_loc = addr.get("addressLocality")
                         elif isinstance(jl, dict):
-                            job_loc = (jl.get("address") or {}).get("addressLocality")
+                            addr = jl.get("address") or {}
+                            if isinstance(addr, dict):
+                                job_loc = addr.get("addressLocality")
 
                         browser.close()
                         return {
@@ -407,11 +488,11 @@ def fetch_job_details(job_url: str):
                                 "company": hiring_org,
                                 "location_hint": job_loc,
                                 "description_snippet": (desc[:500] + "…") if isinstance(desc, str) and len(desc) > 500 else desc,
-                                "source": "dom_jsonld"
+                                "source": "dom_jsonld",
                             }
                         }
 
-                # Minimal fallback: page title
+                # Minimal fallback: just use the page title
                 title = page.title()
                 browser.close()
                 return {
@@ -421,7 +502,7 @@ def fetch_job_details(job_url: str):
                         "status": "ok",
                         "account": account,
                         "title": title,
-                        "source": "dom_title_only"
+                        "source": "dom_title_only",
                     }
                 }
         except Exception as e2:
@@ -432,7 +513,7 @@ def fetch_job_details(job_url: str):
                     "url": job_url,
                     "status": "limited_info",
                     "account": account,
-                    "reason": f"v2_non_200, v3/DOM error: {str(e2)}"
+                    "reason": f"v3/v2 detail non-200 and v3 list/DOM error: {str(e2)}",
                 }
             }
 
@@ -443,7 +524,7 @@ def fetch_job_details(job_url: str):
                 "jobId": job_url.split("/")[-1] if "/" in job_url else "unknown",
                 "url": job_url,
                 "status": "error",
-                "error": str(e)
+                "error": str(e),
             }
         }
 
