@@ -317,30 +317,46 @@ def _browsery_headers(job_url: str):
 
 def fetch_job_details(job_url: str):
     """
-    Fetch details of a single Workable job.
-
+    Fetch details of a single Workable job with enhanced DOM scraping.
+    
     Order of attempts:
-      1) v3 detail:  https://apply.workable.com/api/v3/accounts/{account}/jobs/{shortcode}
-      2) v2 detail:  https://apply.workable.com/api/v2/accounts/{account}/jobs/{shortcode}
-      3) v3 list:    https://apply.workable.com/api/v3/accounts/{account}/jobs (scan for shortcode)
-      4) DOM fallback: JSON-LD on the job page (and finally page title)
-
-    Depends on helpers already in your code:
-      - _parse_workable_url(job_url) -> (account, shortcode)
-      - _browsery_headers(job_url)   -> headers dict
+      1) v3 detail API with enhanced headers
+      2) v2 detail API  
+      3) v3 list API (scan for shortcode)
+      4) Enhanced DOM scraping (extracts ALL visible content)
     """
+    api_attempts = []
+    
     try:
         account, shortcode = _parse_workable_url(job_url)
         v3_detail = f"https://apply.workable.com/api/v3/accounts/{account}/jobs/{shortcode}"
         v2_detail = f"https://apply.workable.com/api/v2/accounts/{account}/jobs/{shortcode}"
         v3_list   = f"https://apply.workable.com/api/v3/accounts/{account}/jobs"
-        headers   = _browsery_headers(job_url)
+        
+        # Enhanced headers with more browser-like behavior
+        headers = {
+            "Accept": "application/json, text/plain, */*",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Accept-Encoding": "gzip, deflate, br",
+            "Referer": f"https://apply.workable.com/{account}/",
+            "Origin": "https://apply.workable.com",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Sec-Fetch-Dest": "empty",
+            "Sec-Fetch-Mode": "cors",
+            "Sec-Fetch-Site": "same-origin",
+            "Cache-Control": "no-cache",
+            "Pragma": "no-cache",
+        }
 
-        # --- Primary: v3 detail endpoint (rich payload incl. description/requirements/benefits) ---
+        # --- Attempt 1: v3 detail endpoint ---
         try:
+            logger.info(f"Trying v3 detail API: {v3_detail}")
             resp = requests.get(v3_detail, headers=headers, timeout=15)
+            api_attempts.append({"endpoint": "v3_detail", "status": resp.status_code})
+            
             if resp.status_code == 200:
                 d = resp.json()
+                logger.info(f"✓ v3 detail API succeeded for {shortcode}")
                 return {
                     "job": {
                         "jobId": d.get("shortcode") or shortcode,
@@ -366,15 +382,20 @@ def fetch_job_details(job_url: str):
                         "source": "v3_detail",
                     }
                 }
-            logger.warning(f"v3 job detail failed {resp.status_code}: {resp.text[:200]}")
+            logger.warning(f"✗ v3 detail failed with {resp.status_code}")
         except Exception as e:
-            logger.warning(f"v3 job detail request error: {e}")
+            logger.warning(f"✗ v3 detail error: {e}")
+            api_attempts.append({"endpoint": "v3_detail", "error": str(e)})
 
-        # --- Fallback #1: v2 detail endpoint (older tenants) ---
+        # --- Attempt 2: v2 detail endpoint ---
         try:
+            logger.info(f"Trying v2 detail API: {v2_detail}")
             resp = requests.get(v2_detail, headers=headers, timeout=15)
+            api_attempts.append({"endpoint": "v2_detail", "status": resp.status_code})
+            
             if resp.status_code == 200:
                 d = resp.json()
+                logger.info(f"✓ v2 detail API succeeded for {shortcode}")
                 return {
                     "job": {
                         "jobId": shortcode,
@@ -395,22 +416,30 @@ def fetch_job_details(job_url: str):
                         "source": "v2_detail",
                     }
                 }
-            logger.warning(f"v2 job detail failed {resp.status_code}: {resp.text[:200]}")
+            logger.warning(f"✗ v2 detail failed with {resp.status_code}")
         except Exception as e:
-            logger.warning(f"v2 job detail request error: {e}")
+            logger.warning(f"✗ v2 detail error: {e}")
+            api_attempts.append({"endpoint": "v2_detail", "error": str(e)})
 
-        # --- Fallback #2: v3 listing; scan pages for matching shortcode ---
+        # --- Attempt 3: v3 listing scan ---
         try:
-            params = {"limit": 20}
+            logger.info(f"Trying v3 list scan: {v3_list}")
+            params = {"limit": 50}
             seen_pages = set()
-            while True:
+            max_scan_pages = 5
+            scan_count = 0
+            
+            while scan_count < max_scan_pages:
                 r = requests.get(v3_list, headers=headers, params=params, timeout=15)
                 if r.status_code != 200:
-                    logger.warning(f"v3 list failed {r.status_code}: {r.text[:200]}")
+                    logger.warning(f"✗ v3 list failed with {r.status_code}")
+                    api_attempts.append({"endpoint": "v3_list", "status": r.status_code})
                     break
+                    
                 data = r.json()
                 for job in data.get("results", []):
                     if job.get("shortcode") == shortcode:
+                        logger.info(f"✓ Found job in v3 list (page {scan_count + 1})")
                         return {
                             "job": {
                                 "jobId": shortcode,
@@ -432,93 +461,176 @@ def fetch_job_details(job_url: str):
                                 "source": "v3_list_match",
                             }
                         }
+                
                 nextp = data.get("nextPage")
                 if not nextp or nextp in seen_pages:
                     break
                 seen_pages.add(nextp)
-                params = {"limit": 20, "nextPage": nextp}
+                params = {"limit": 50, "nextPage": nextp}
+                scan_count += 1
+                
+            logger.warning(f"✗ Job not found in v3 list after {scan_count} pages")
         except Exception as e:
-            logger.warning(f"v3 list fallback error: {e}")
+            logger.warning(f"✗ v3 list scan error: {e}")
+            api_attempts.append({"endpoint": "v3_list", "error": str(e)})
 
-        # --- Fallback #3: DOM scrape (JSON-LD first, then page title) ---
+        # --- Attempt 4: ENHANCED DOM SCRAPING ---
+        logger.info(f"All APIs failed, using enhanced DOM scraping for {job_url}")
         try:
             with sync_playwright() as p:
                 browser = p.chromium.launch(headless=True)
                 page = browser.new_page(extra_http_headers={"User-Agent": headers["User-Agent"]})
                 page.goto(job_url, wait_until="networkidle", timeout=35000)
-                page.wait_for_timeout(1500)
+                page.wait_for_timeout(2000)
 
-                # Try JSON-LD block
+                job_data = {
+                    "jobId": shortcode,
+                    "url": job_url,
+                    "status": "ok",
+                    "account": account,
+                    "source": "dom_enhanced",
+                    "api_attempts": api_attempts,
+                }
+
+                # Extract title (multiple methods)
+                title = None
+                title_selectors = [
+                    'h1[data-ui="job-title"]',
+                    'h1',
+                    '[data-ui="title"]',
+                    '.job-title'
+                ]
+                for sel in title_selectors:
+                    el = page.query_selector(sel)
+                    if el:
+                        title = el.inner_text().strip()
+                        if title:
+                            break
+                
+                if not title:
+                    title = page.title()
+                
+                job_data["title"] = title
+
+                # Extract location
+                location_selectors = [
+                    '[data-ui="job-location"]',
+                    '[data-ui="location"]',
+                    '.location',
+                    'span:has-text("Remote")',
+                    'span:has-text("Location")'
+                ]
+                for sel in location_selectors:
+                    el = page.query_selector(sel)
+                    if el:
+                        loc = el.inner_text().strip()
+                        if loc:
+                            job_data["location"] = loc
+                            break
+
+                # Extract department
+                dept_el = page.query_selector('[data-ui="job-department"]')
+                if dept_el:
+                    job_data["department"] = dept_el.inner_text().strip()
+
+                # Extract job type (Full-time, Part-time, etc.)
+                type_el = page.query_selector('[data-ui="job-type"]')
+                if type_el:
+                    job_data["type"] = type_el.inner_text().strip()
+
+                # Extract workplace type (Remote, Hybrid, On-site)
+                workplace_el = page.query_selector('[data-ui="job-workplace"]')
+                if workplace_el:
+                    job_data["workplace"] = workplace_el.inner_text().strip()
+
+                # Extract description section
+                desc_selectors = [
+                    '[data-ui="job-description"]',
+                    'section:has-text("Description")',
+                    'div[class*="description"]',
+                    '.job-description'
+                ]
+                for sel in desc_selectors:
+                    el = page.query_selector(sel)
+                    if el:
+                        job_data["description_html"] = el.inner_html()
+                        break
+
+                # Extract requirements section  
+                req_selectors = [
+                    '[data-ui="job-requirements"]',
+                    'section:has-text("Requirements")',
+                    'div[class*="requirements"]'
+                ]
+                for sel in req_selectors:
+                    el = page.query_selector(sel)
+                    if el:
+                        job_data["requirements_html"] = el.inner_html()
+                        break
+
+                # Extract benefits section
+                benefits_selectors = [
+                    '[data-ui="job-benefits"]',
+                    'section:has-text("Benefits")',
+                    'div[class*="benefits"]'
+                ]
+                for sel in benefits_selectors:
+                    el = page.query_selector(sel)
+                    if el:
+                        job_data["benefits_html"] = el.inner_html()
+                        break
+
+                # Try JSON-LD for additional data
                 script = page.query_selector('script[type="application/ld+json"]')
                 if script:
                     try:
-                        ld_raw = script.inner_text()
-                        ld = json.loads(ld_raw)
-                    except Exception:
-                        ld = None
+                        ld = json.loads(script.inner_text())
+                        if isinstance(ld, dict):
+                            if not job_data.get("title"):
+                                job_data["title"] = ld.get("title") or ld.get("name")
+                            
+                            if "hiringOrganization" in ld:
+                                org = ld["hiringOrganization"]
+                                if isinstance(org, dict):
+                                    job_data["company"] = org.get("name")
+                            
+                            if "datePosted" in ld:
+                                job_data["published"] = ld.get("datePosted")
+                            
+                            if "employmentType" in ld:
+                                job_data["employment_type"] = ld.get("employmentType")
+                                
+                            if "jobLocation" in ld and not job_data.get("location"):
+                                jl = ld["jobLocation"]
+                                if isinstance(jl, list) and jl:
+                                    jl = jl[0]
+                                if isinstance(jl, dict):
+                                    addr = jl.get("address", {})
+                                    if isinstance(addr, dict):
+                                        job_data["location"] = addr.get("addressLocality")
+                    except Exception as e:
+                        logger.debug(f"JSON-LD parsing error: {e}")
 
-                    if isinstance(ld, dict):
-                        title = ld.get("title") or ld.get("name")
-                        desc = ld.get("description")
-                        hiring_org = None
-                        jo = ld.get("hiringOrganization")
-                        if isinstance(jo, dict):
-                            hiring_org = jo.get("name")
-
-                        job_loc = None
-                        jl = ld.get("jobLocation")
-                        if isinstance(jl, list) and jl:
-                            if isinstance(jl[0], dict):
-                                addr = jl[0].get("address") or {}
-                                if isinstance(addr, dict):
-                                    job_loc = addr.get("addressLocality")
-                        elif isinstance(jl, dict):
-                            addr = jl.get("address") or {}
-                            if isinstance(addr, dict):
-                                job_loc = addr.get("addressLocality")
-
-                        browser.close()
-                        return {
-                            "job": {
-                                "jobId": shortcode,
-                                "url": job_url,
-                                "status": "ok",
-                                "account": account,
-                                "title": title,
-                                "company": hiring_org,
-                                "location_hint": job_loc,
-                                "description_snippet": (desc[:500] + "…") if isinstance(desc, str) and len(desc) > 500 else desc,
-                                "source": "dom_jsonld",
-                            }
-                        }
-
-                # Minimal fallback: just use the page title
-                title = page.title()
                 browser.close()
-                return {
-                    "job": {
-                        "jobId": shortcode,
-                        "url": job_url,
-                        "status": "ok",
-                        "account": account,
-                        "title": title,
-                        "source": "dom_title_only",
-                    }
-                }
+                
+                logger.info(f"✓ DOM scraping extracted: {list(job_data.keys())}")
+                return {"job": job_data}
+                
         except Exception as e2:
-            logger.warning(f"DOM fallback failed: {e2}")
+            logger.error(f"✗ DOM fallback failed: {e2}")
             return {
                 "job": {
                     "jobId": shortcode,
                     "url": job_url,
                     "status": "limited_info",
                     "account": account,
-                    "reason": f"v3/v2 detail non-200 and v3 list/DOM error: {str(e2)}",
+                    "error": f"All methods failed. DOM error: {str(e2)}",
+                    "api_attempts": api_attempts,
                 }
             }
 
     except Exception as e:
-        logger.error(f"Error fetching job details: {e}")
+        logger.error(f"Critical error fetching job details: {e}")
         return {
             "job": {
                 "jobId": job_url.split("/")[-1] if "/" in job_url else "unknown",
@@ -527,7 +639,6 @@ def fetch_job_details(job_url: str):
                 "error": str(e),
             }
         }
-
 # --- Endpoints ---
 
 @app.get("/scrape-links")
