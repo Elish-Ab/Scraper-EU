@@ -12,14 +12,6 @@ def is_lever_url(url: str) -> bool:
     return host.endswith("lever.co")
 
 
-def is_lever_job_url(url: str) -> bool:
-    try:
-        parse_lever_job_url(url)
-        return True
-    except ValueError:
-        return False
-
-
 def parse_lever_board_url(board_url: str) -> str:
     parsed = urlparse(board_url)
     host = parsed.netloc.lower()
@@ -116,7 +108,7 @@ def extract_job_with_lever_api(job_url: str):
     try:
         company, posting_id = parse_lever_job_url(job_url)
     except ValueError as exc:
-        logger.info(str(exc))
+        logger.error(str(exc))
         return None
 
     api_url = f"https://api.lever.co/v0/postings/{company}/{posting_id}?mode=json"
