@@ -9,6 +9,8 @@ import json
 import time
 import random
 
+from app.lever_scraper import extract_job_with_lever_api, get_links_from_lever_api, is_lever_url
+
 app = FastAPI()
 
 logging.basicConfig(level=logging.INFO)
@@ -826,6 +828,11 @@ def get_job_links(
     logger.info(f"{'='*80}")
     
     try:
+        if is_lever_url(url):
+            links = get_links_from_lever_api(url, days=days)
+            if links:
+                return {"success": True, "total": len(links), "jobs": links, "method": "api"}
+
         # Try API
         links = get_links_from_api(url, days=days if days > 0 else 9999)  # Use 9999 days for "all"
         
@@ -849,11 +856,18 @@ def get_job_links(
         return {"success": False, "total": 0, "jobs": [], "error": str(e)}
 
 @app.get("/get-job-details")
-def get_job_details(url: str = Query(..., description="Workable job URL")):
+def get_job_details(url: str = Query(..., description="Workable or Lever job URL")):
     """Get full job details - DOM first, then API fallback"""
     logger.info(f"\n🎯 GET DETAILS: {url}")
     
     try:
+        if is_lever_url(url):
+            api_result = extract_job_with_lever_api(url)
+            if api_result and api_result.get("title"):
+                api_result["method"] = "api"
+                return {"success": True, "job": api_result}
+            return {"success": False, "error": "Lever API failed", "url": url}
+
         account, shortcode = _parse_workable_url(url)
         
         # Try DOM
@@ -888,10 +902,11 @@ def health():
 @app.get("/")
 def root():
     return {
-        "name": "Workable Scraper v5 - Production",
+        "name": "Workable + Lever Scraper v5 - Production",
         "version": "5.0",
         "improvements": [
             "✨ POST API support (80%+ success rate boost)",
+            "🧲 Lever API support",
             "🔄 Job deduplication by title",
             "🌍 Country/location merging",
             "🍪 Cloudflare cookie support",
