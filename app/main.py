@@ -1,5 +1,5 @@
-#  app/main.py
-from fastapi import FastAPI, Query #type: ignore
+# app/main.py - Modified for n8n workflow integration
+from fastapi import FastAPI, Query, HTTPException #type: ignore
 from urllib.parse import urljoin, urlparse
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout #type: ignore
 import requests
@@ -9,11 +9,11 @@ import logging
 import json
 import time
 import random
-
-from app.lever_scraper import extract_job_with_lever_api, get_links_from_lever_api, is_lever_url
+from collections import defaultdict
+from typing import Optional
+from app.lever_scraper import extract_job_with_lever_api, is_lever_url
 
 app = FastAPI()
-
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -21,19 +21,209 @@ MAX_DAYS = 30
 MAX_RETRIES = 3
 RETRY_DELAY_BASE = 2
 
-# === HELPERS ===
+# ============================================================================
+# GLOBAL RATE LIMITER - Persists across n8n requests
+# ============================================================================
 
-def random_delay(base=1, variance=0.5):
-    """Add random delay to avoid detection"""
-    delay = base + random.uniform(-variance, variance)
-    time.sleep(max(0.1, delay))
+class GlobalRateLimiter:
+    """
+    Rate limiter that works across multiple n8n requests
+    Tracks requests globally to prevent n8n from overwhelming the API
+    """
+    
+    def __init__(self):
+        # Track requests per domain
+        self.request_times = defaultdict(list)
+        self.domain_cooldowns = {}
+        self.consecutive_errors = defaultdict(int)
+        
+        # Configuration - VERY CONSERVATIVE for n8n
+        self.max_requests_per_5min = 8
+        self.min_delay_seconds = 5
+        self.max_delay_seconds = 10
+        self.cooldown_minutes = 15
+        
+    def can_make_request(self, domain: str) -> tuple[bool, float]:
+        """
+        Check if we can make a request now
+        Returns: (can_proceed, wait_seconds)
+        """
+        now = datetime.now()
+        
+        # Check if domain is in cooldown
+        if domain in self.domain_cooldowns:
+            cooldown_end = self.domain_cooldowns[domain]
+            if now < cooldown_end:
+                wait_seconds = (cooldown_end - now).total_seconds()
+                logger.warning(f"⏸️  Domain {domain} in cooldown: {wait_seconds:.0f}s remaining")
+                return False, wait_seconds
+            else:
+                # Cooldown expired
+                del self.domain_cooldowns[domain]
+                self.consecutive_errors[domain] = 0
+        
+        # Clean old requests (older than 5 minutes)
+        cutoff = now - timedelta(minutes=5)
+        self.request_times[domain] = [
+            t for t in self.request_times[domain] if t > cutoff
+        ]
+        
+        # Check if we've hit the rate limit
+        recent_requests = len(self.request_times[domain])
+        
+        if recent_requests >= self.max_requests_per_5min:
+            # Calculate wait time until oldest request expires
+            oldest = self.request_times[domain][0]
+            wait_time = 300 - (now - oldest).total_seconds()
+            
+            if wait_time > 0:
+                logger.warning(f"⏳ Rate limit reached: {recent_requests}/{self.max_requests_per_5min} requests in 5min")
+                return False, wait_time
+        
+        # Add minimum delay between requests
+        if self.request_times[domain]:
+            last_request = self.request_times[domain][-1]
+            time_since_last = (now - last_request).total_seconds()
+            
+            if time_since_last < self.min_delay_seconds:
+                wait_needed = self.min_delay_seconds - time_since_last
+                logger.info(f"⏱️  Enforcing minimum delay: {wait_needed:.1f}s")
+                return False, wait_needed
+        
+        return True, 0
+    
+    def record_request(self, domain: str):
+        """Record that a request was made"""
+        self.request_times[domain].append(datetime.now())
+    
+    def record_success(self, domain: str):
+        """Record successful request"""
+        if domain in self.consecutive_errors:
+            self.consecutive_errors[domain] = max(0, self.consecutive_errors[domain] - 1)
+    
+    def record_rate_limit(self, domain: str):
+        """Record that we got rate limited"""
+        self.consecutive_errors[domain] += 1
+        
+        # Increase cooldown time based on consecutive errors
+        cooldown_multiplier = min(self.consecutive_errors[domain], 4)
+        cooldown_minutes = self.cooldown_minutes * cooldown_multiplier
+        
+        self.domain_cooldowns[domain] = datetime.now() + timedelta(minutes=cooldown_minutes)
+        
+        logger.error(f"🚫 Rate limited! Cooldown: {cooldown_minutes} min (error #{self.consecutive_errors[domain]})")
+    
+    def get_stats(self, domain: str) -> dict:
+        """Get current stats for a domain"""
+        now = datetime.now()
+        cutoff = now - timedelta(minutes=5)
+        
+        recent_requests = [t for t in self.request_times[domain] if t > cutoff]
+        
+        in_cooldown = False
+        cooldown_remaining = 0
+        
+        if domain in self.domain_cooldowns:
+            cooldown_end = self.domain_cooldowns[domain]
+            if now < cooldown_end:
+                in_cooldown = True
+                cooldown_remaining = (cooldown_end - now).total_seconds()
+        
+        return {
+            "domain": domain,
+            "requests_last_5min": len(recent_requests),
+            "max_requests_per_5min": self.max_requests_per_5min,
+            "in_cooldown": in_cooldown,
+            "cooldown_remaining_seconds": int(cooldown_remaining),
+            "consecutive_errors": self.consecutive_errors[domain]
+        }
+
+# Global instance - persists across requests
+global_rate_limiter = GlobalRateLimiter()
+
+
+class BrowserRotator:
+    """Rotate browser fingerprints"""
+    
+    USER_AGENTS = [
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:132.0) Gecko/20100101 Firefox/132.0',
+        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.1 Safari/605.1.15',
+        'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+    ]
+    
+    @classmethod
+    def get_headers(cls):
+        return {
+            'User-Agent': random.choice(cls.USER_AGENTS),
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+            'Accept-Language': random.choice(['en-US,en;q=0.9', 'en-GB,en;q=0.9', 'en-CA,en;q=0.9']),
+            'Accept-Encoding': 'gzip, deflate, br',
+            'DNT': '1',
+            'Connection': 'keep-alive',
+            'Upgrade-Insecure-Requests': '1',
+        }
+    
+    @classmethod
+    def get_random_viewport(cls):
+        return {
+            'width': random.choice([1366, 1440, 1920]),
+            'height': random.choice([768, 900, 1080])
+        }
+
+
+# ============================================================================
+# HELPER FUNCTIONS
+# ============================================================================
+
+def wait_for_rate_limit(domain: str, max_wait: int = 300):
+    """
+    Wait if needed before making request
+    Returns True if request can proceed, False if should abort
+    """
+    can_proceed, wait_seconds = global_rate_limiter.can_make_request(domain)
+    
+    if not can_proceed:
+        if wait_seconds > max_wait:
+            # Wait time too long - tell n8n to retry later
+            logger.error(f"❌ Wait time too long: {wait_seconds:.0f}s (max: {max_wait}s)")
+            raise HTTPException(
+                status_code=429,
+                detail={
+                    "error": "rate_limit_exceeded",
+                    "message": f"Please retry after {int(wait_seconds)} seconds",
+                    "retry_after_seconds": int(wait_seconds),
+                    "domain": domain
+                }
+            )
+        
+        # Wait and continue
+        logger.info(f"⏳ Waiting {wait_seconds:.0f}s before request...")
+        time.sleep(wait_seconds)
+        
+        # Add random extra delay
+        extra_delay = random.uniform(2, 5)
+        time.sleep(extra_delay)
+    else:
+        # Add standard random delay
+        delay = random.uniform(
+            global_rate_limiter.min_delay_seconds, 
+            global_rate_limiter.max_delay_seconds
+        )
+        logger.info(f"⏱️  Random delay: {delay:.1f}s")
+        time.sleep(delay)
+    
+    # Record the request
+    global_rate_limiter.record_request(domain)
+    return True
+
 
 def _parse_workable_url(job_url: str):
     """Parse Workable URL to extract account and shortcode"""
     u = urlparse(job_url)
     path = u.path if u.path else job_url
     parts = [p for p in path.strip("/").split("/") if p]
-
     try:
         j_idx = len(parts) - 1 - parts[::-1].index("j")
         account = parts[j_idx - 1]
@@ -44,508 +234,14 @@ def _parse_workable_url(job_url: str):
             return parts[-3], parts[-1]
         raise ValueError(f"Cannot parse Workable URL: {job_url}")
 
-# === GET JOB LINKS ===
 
-def get_links_from_api(board_url: str, days: int = 5):
-    """
-    Get jobs from LAST {days} DAYS using POST/GET methods
-    - Deduplicates by title
-    - Merges locations/countries
-    - Uses Cloudflare cookies
-    """
-    try:
-        # Clean URL - remove hash fragments
-        clean_url = board_url.split('#')[0].rstrip('/')
-        subdomain = clean_url.strip("/").split("/")[-1]
-        api_url = f"https://apply.workable.com/api/v3/accounts/{subdomain}/jobs"
-        
-        logger.info(f"🔌 API: Fetching jobs from last {days} days...")
-        logger.info(f"   Subdomain: {subdomain}")
-
-        # === 1. Get Cloudflare cookies ===
-        cookies = {}
-        try:
-            with sync_playwright() as p:
-                browser = p.chromium.launch(headless=True)
-                context = browser.new_context(
-                    user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"
-                )
-                page = context.new_page()
-                page.goto(clean_url, wait_until="networkidle", timeout=30000)
-                page.wait_for_timeout(3000)
-                
-                # Dismiss cookie consent
-                try:
-                    page.click("text=Accept", timeout=3000)
-                except:
-                    pass
-                
-                for c in context.cookies():
-                    if c["name"] in ["cf_clearance", "__cf_bm", "wmc"]:
-                        cookies[c["name"]] = c["value"]
-                browser.close()
-        except Exception as e:
-            logger.warning(f"Cookie extraction failed: {e}")
-
-        headers = {
-            "Accept": "application/json",
-            "Content-Type": "application/json",
-            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36",
-            "Origin": "https://apply.workable.com",
-            "Referer": board_url,
-        }
-        
-        if cookies:
-            headers["Cookie"] = "; ".join([f"{k}={v}" for k, v in cookies.items()])
-            logger.info(f"   Using cookies: {list(cookies.keys())}")
-
-        # === 2. Try POST then GET ===
-        cutoff_date = datetime.now(timezone.utc) - timedelta(days=days)
-        all_jobs = []
-        
-        for method in ["POST", "GET"]:
-            try:
-                logger.info(f"   Trying {method} method...")
-                
-                next_page = None
-                page_num = 0
-                all_jobs = []
-                pagination_incomplete = False
-
-                while page_num < 100:
-                    page_num += 1
-                    
-                    if method == "POST":
-                        payload = {"query": "", "location": [], "department": [], "worktype": [], "remote": []}
-                        if next_page:
-                            # For POST, nextPage goes at root level
-                            payload = {
-                                "query": "",
-                                "location": [],
-                                "department": [],
-                                "worktype": [],
-                                "remote": [],
-                                "nextPage": next_page
-                            }
-                        
-                        logger.debug(f"   POST payload: {json.dumps(payload)[:100]}")
-                        resp = requests.post(api_url, json=payload, headers=headers, timeout=20)
-                    else:
-                        params = {"limit": 50}
-                        if next_page:
-                            params["nextPage"] = next_page
-                        resp = requests.get(api_url, params=params, headers=headers, timeout=20)
-
-                    if resp.status_code == 429:
-                        logger.warning(f"   Rate limited, waiting...")
-                        time.sleep(10)
-                        continue
-                        
-                    if resp.status_code == 400:
-                        logger.warning(f"   {method} pagination failed with 400 (nextPage token issue)")
-                        pagination_incomplete = True
-                        break
-                        
-                    if resp.status_code != 200:
-                        logger.warning(f"   {method} failed: {resp.status_code}")
-                        break
-
-                    data = resp.json()
-                    results = data.get("results", [])
-                    
-                    if not results:
-                        logger.info(f"   No results on page {page_num}")
-                        break
-                    
-                    logger.info(f"   Page {page_num}: {len(results)} jobs")
-
-                    # Collect all jobs, track if page has recent jobs
-                    page_has_recent_jobs = False
-                    for job in results:
-                        pub_str = job.get("published")
-                        is_recent = True
-                        
-                        if pub_str:
-                            if pub_str.endswith("Z"):
-                                pub_str = pub_str[:-1] + "+00:00"
-                            
-                            try:
-                                pub_date = datetime.fromisoformat(pub_str)
-                                if pub_date >= cutoff_date:
-                                    page_has_recent_jobs = True
-                                else:
-                                    is_recent = False
-                            except:
-                                pass
-
-                        # Collect all jobs regardless of date (we'll filter later)
-                        all_jobs.append(job)
-                    
-                    # Only stop if entire page has NO recent jobs
-                    if not page_has_recent_jobs and page_num > 1:
-                        logger.info(f"   Page {page_num} has no recent jobs, stopping pagination")
-                        break
-
-                    next_page = data.get("nextPage")
-                    if not next_page:
-                        break
-
-                    time.sleep(0.5)
-
-                if all_jobs and not pagination_incomplete:
-                    logger.info(f"✅ {method} fetched {len(all_jobs)} jobs successfully")
-                    break
-                elif all_jobs and pagination_incomplete:
-                    logger.info(f"⚠ {method} fetched {len(all_jobs)} jobs but pagination incomplete, trying next method")
-                    continue
-                else:
-                    logger.info(f"   {method} returned no jobs, trying next method")
-                    continue
-                    
-            except Exception as e:
-                logger.warning(f"   {method} error: {e}")
-                continue
-
-        if not all_jobs:
-            logger.info("No jobs found via API")
-            return []
-
-        logger.info(f"   Collected {len(all_jobs)} total jobs from API")
-
-        # === 3. Filter by date ===
-        filtered_jobs = []
-        for job in all_jobs:
-            pub_str = job.get("published")
-            if pub_str:
-                if pub_str.endswith("Z"):
-                    pub_str = pub_str[:-1] + "+00:00"
-                try:
-                    pub_date = datetime.fromisoformat(pub_str)
-                    if pub_date >= cutoff_date:
-                        filtered_jobs.append(job)
-                except:
-                    filtered_jobs.append(job)  # Include if can't parse
-            else:
-                filtered_jobs.append(job)  # Include if no date
-
-        logger.info(f"   After date filter: {len(filtered_jobs)} jobs (last {days} days)")
-
-        if not filtered_jobs:
-            logger.info(f"   No jobs within last {days} days")
-            return []
-
-        # === 4. Deduplicate by title + merge locations ===
-        job_map = {}
-        
-        for job in filtered_jobs:
-            title = job.get("title", "").strip()
-            if not title:
-                continue
-
-            if title not in job_map:
-                locations = job.get("locations", [])
-                countries = {loc.get("country") for loc in locations if loc.get("country")}
-                
-                job_map[title] = {
-                    "title": title,
-                    "shortcode": job["shortcode"],
-                    "countries": countries,
-                    "published": job.get("published", ""),
-                    "remote": job.get("remote", False),
-                    "department": job.get("department", []),
-                    "type": job.get("type"),
-                    "workplace": job.get("workplace")
-                }
-            else:
-                # Merge countries for duplicate titles
-                locations = job.get("locations", [])
-                new_countries = {loc.get("country") for loc in locations if loc.get("country")}
-                job_map[title]["countries"].update(new_countries)
-
-        # === 4. Build final list ===
-        final_jobs = []
-        for title, data in job_map.items():
-            url = urljoin(board_url, f"j/{data['shortcode']}/")
-            countries_list = sorted(data["countries"])
-            
-            final_jobs.append({
-                "url": url,
-                "title": title,
-                "countries": countries_list,
-                "country_count": len(countries_list),
-                "remote": data["remote"],
-                "published": data["published"][:10] if data["published"] else "",
-                "method": "api"
-            })
-            
-            logger.info(f"   JOB: {title[:50]}... → {len(countries_list)} countries")
-
-        logger.info(f"✅ FINAL: {len(final_jobs)} unique jobs (last {days} days)")
-        return final_jobs
-
-    except Exception as e:
-        logger.error(f"API error: {e}")
-        import traceback
-        logger.error(traceback.format_exc())
-        return []
-
-def get_links_from_dom_v5(board_url: str):
-    """ULTRA-ROBUST DOM scraper with multiple strategies"""
-    
-    # Clean URL - remove hash fragments
-    clean_url = board_url.split('#')[0].rstrip('/')
-    
-    for attempt in range(MAX_RETRIES):
-        all_links = []
-        try:
-            logger.info(f"🌐 DOM attempt {attempt + 1}")
-            
-            with sync_playwright() as p:
-                browser = p.chromium.launch(
-                    headless=True,
-                    args=[
-                        '--disable-blink-features=AutomationControlled',
-                        '--disable-dev-shm-usage',
-                        '--no-sandbox'
-                    ]
-                )
-                
-                context = browser.new_context(
-                    user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                    viewport={'width': 1920, 'height': 1080}
-                )
-                
-                page = context.new_page()
-                
-                try:
-                    page.goto(clean_url, wait_until="domcontentloaded", timeout=40000)
-                except PlaywrightTimeout:
-                    logger.warning("   Navigation timeout, continuing...")
-                
-                page.wait_for_timeout(3000)
-                
-                try:
-                    page.wait_for_load_state("networkidle", timeout=10000)
-                except:
-                    pass
-                
-                page.wait_for_timeout(2000)
-                
-                # Dismiss overlays
-                overlay_selectors = [
-                    "[data-ui='cookie-consent'] button",
-                    "button:has-text('Accept')",
-                    "button:has-text('Accept All')",
-                    "[data-ui='backdrop']"
-                ]
-                
-                for sel in overlay_selectors:
-                    try:
-                        btn = page.query_selector(sel)
-                        if btn and btn.is_visible():
-                            btn.click(timeout=2000)
-                            page.wait_for_timeout(1000)
-                    except:
-                        pass
-                
-                # STRATEGY 1: Find job elements
-                job_selectors = [
-                    "li[data-ui='job']",
-                    "li[data-ui='job-opening']",
-                    "li[data-ui='job-board-position']",
-                    ".job-item",
-                    "[role='listitem']",
-                    "div[data-ui='job-card']"
-                ]
-                
-                job_elements = []
-                selected_selector = None
-                for selector in job_selectors:
-                    try:
-                        elements = page.query_selector_all(selector)
-                        if elements:
-                            job_elements = elements
-                            selected_selector = selector
-                            logger.info(f"   Found {len(elements)} with: {selector}")
-                            break
-                    except:
-                        continue
-                
-                # STRATEGY 2: Search all links with /j/
-                if not job_elements:
-                    logger.info("   No job elements, searching all links...")
-                    try:
-                        all_page_links = page.query_selector_all("a[href]")
-                        for link in all_page_links:
-                            href = link.get_attribute("href")
-                            if href and '/j/' in href and len(href.split('/j/')[1].split('/')[0]) > 5:
-                                full_url = urljoin(clean_url, href)
-                                if full_url not in all_links:
-                                    all_links.append(full_url)
-                        
-                        if all_links:
-                            logger.info(f"   ✓ Found {len(all_links)} links via href search")
-                    except Exception as e:
-                        logger.debug(f"   Link search error: {e}")
-                
-                # STRATEGY 3: Check for "no jobs" message
-                if not job_elements and not all_links:
-                    page_text = page.inner_text('body').lower()
-                    no_jobs_indicators = [
-                        "no open positions",
-                        "no positions available",
-                        "currently no openings",
-                        "no jobs at the moment",
-                        "not hiring"
-                    ]
-                    
-                    if any(indicator in page_text for indicator in no_jobs_indicators):
-                        logger.info("   ℹ️ Page shows no open positions")
-                        browser.close()
-                        return []
-                
-                # Process job elements - COLLECT ALL INITIALLY
-                if job_elements:
-                    cutoff_date = datetime.utcnow() - timedelta(days=MAX_DAYS)
-                    
-                    logger.info(f"   Processing {len(job_elements)} initial job elements...")
-                    for item in job_elements:
-                        try:
-                            link_el = None
-                            for link_sel in ["a[aria-labelledby]", "a[href*='/j/']", "a"]:
-                                link_el = item.query_selector(link_sel)
-                                if link_el:
-                                    break
-                            
-                            if not link_el:
-                                continue
-
-                            href = link_el.get_attribute("href")
-                            if not href or '/j/' not in href:
-                                continue
-                            
-                            # Check age
-                            posted_el = item.query_selector("[data-ui='job-posted']")
-                            if posted_el:
-                                text = posted_el.inner_text().strip()
-                                match = re.search(r"(\d+)\s+day", text)
-                                if match and int(match.group(1)) > MAX_DAYS:
-                                    continue
-
-                            full_url = urljoin(clean_url, href)
-                            if full_url not in all_links:
-                                all_links.append(full_url)
-                                
-                        except:
-                            continue
-                    
-                    logger.info(f"   Collected {len(all_links)} jobs initially")
-                
-                # Try "Load More" buttons
-                load_more_selectors = [
-                    "button[data-ui='load-more-button']",
-                    "button:has-text('Show more')",
-                    "button:has-text('Load more')",
-                    "button:has-text('View more jobs')"
-                ]
-                
-                previous_count = len(all_links)
-                consecutive_no_change = 0
-                max_no_change = 3
-                
-                for load_attempt in range(20):
-                    # Check if button exists and is visible
-                    btn_found = False
-                    for btn_selector in load_more_selectors:
-                        try:
-                            btn = page.query_selector(btn_selector)
-                            if btn and btn.is_visible():
-                                btn_found = True
-                                logger.info(f"   Clicking '{btn_selector}' ({load_attempt + 1})...")
-                                
-                                # Scroll button into view
-                                btn.scroll_into_view_if_needed()
-                                page.wait_for_timeout(500)
-                                
-                                # Click and wait
-                                btn.click(force=True, timeout=5000)
-                                page.wait_for_timeout(5000)  # Longer wait
-                                
-                                # Get current count before re-scanning
-                                before_scan = len(all_links)
-                                
-                                # Re-scan ALL job elements
-                                new_elements = page.query_selector_all(selected_selector)
-                                logger.info(f"   Page now has {len(new_elements)} total job elements")
-                                
-                                # Process ALL elements (not just new ones)
-                                all_links = []  # Reset to avoid duplicates
-                                for item in new_elements:
-                                    try:
-                                        link_el = None
-                                        for link_sel in ["a[aria-labelledby]", "a[href*='/j/']", "a"]:
-                                            link_el = item.query_selector(link_sel)
-                                            if link_el:
-                                                break
-                                        
-                                        if link_el:
-                                            href = link_el.get_attribute("href")
-                                            if href and '/j/' in href:
-                                                full_url = urljoin(clean_url, href)
-                                                if full_url not in all_links:
-                                                    all_links.append(full_url)
-                                    except:
-                                        continue
-                                
-                                job_elements = new_elements
-                                
-                                # Check if we got new jobs
-                                if len(all_links) > before_scan:
-                                    new_count = len(all_links) - before_scan
-                                    logger.info(f"   ✓ Found {new_count} new jobs (total: {len(all_links)})")
-                                    consecutive_no_change = 0
-                                else:
-                                    consecutive_no_change += 1
-                                    logger.info(f"   No new jobs ({consecutive_no_change}/{max_no_change})")
-                                    if consecutive_no_change >= max_no_change:
-                                        logger.info(f"   Stopping - no new jobs after {max_no_change} attempts")
-                                        break
-                                
-                                break  # Break from selector loop
-                        except Exception as e:
-                            logger.debug(f"   Button click error: {e}")
-                            continue
-                    
-                    if not btn_found or consecutive_no_change >= max_no_change:
-                        if not btn_found:
-                            logger.info("   No load more button found")
-                        break
-                
-                browser.close()
-                
-                if all_links:
-                    logger.info(f"✅ DOM: {len(all_links)} unique links")
-                    return list(set(all_links))
-                else:
-                    if attempt < MAX_RETRIES - 1:
-                        delay = RETRY_DELAY_BASE * (2 ** attempt)
-                        logger.info(f"   Retry in {delay}s...")
-                        time.sleep(delay)
-                        continue
-                    return []
-                    
-        except Exception as e:
-            logger.error(f"DOM attempt {attempt + 1} failed: {e}")
-            if attempt < MAX_RETRIES - 1:
-                time.sleep(RETRY_DELAY_BASE * (2 ** attempt))
-                continue
-    
-    return []
-
-# === GET JOB DETAILS ===
+# ============================================================================
+# SCRAPING FUNCTIONS
+# ============================================================================
 
 def extract_job_with_dom(job_url: str, account: str, shortcode: str):
-    """Extract job details from DOM"""
+    """Extract job details from DOM with rate limiting"""
+    domain = urlparse(job_url).netloc
     
     for attempt in range(MAX_RETRIES):
         try:
@@ -556,27 +252,27 @@ def extract_job_with_dom(job_url: str, account: str, shortcode: str):
                 )
                 
                 context = browser.new_context(
-                    user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                    viewport={'width': 1920, 'height': 1080}
+                    user_agent=random.choice(BrowserRotator.USER_AGENTS),
+                    viewport=BrowserRotator.get_random_viewport()
                 )
                 
                 page = context.new_page()
                 page.goto(job_url, wait_until="domcontentloaded", timeout=30000)
-                page.wait_for_timeout(3000)
+                page.wait_for_timeout(random.randint(3000, 5000))
                 
-                # Check for error
+                # Check for error page
                 body_text = page.inner_text('body').lower()
                 if "error" in body_text and len(body_text) < 100:
                     page.reload(wait_until="domcontentloaded")
-                    page.wait_for_timeout(3000)
+                    page.wait_for_timeout(random.randint(3000, 5000))
                     body_text = page.inner_text('body').lower()
-                
-                if "error" in body_text and len(body_text) < 100:
-                    browser.close()
-                    if attempt < MAX_RETRIES - 1:
-                        time.sleep(RETRY_DELAY_BASE * (2 ** attempt))
-                        continue
-                    return None
+                    
+                    if "error" in body_text and len(body_text) < 100:
+                        browser.close()
+                        if attempt < MAX_RETRIES - 1:
+                            time.sleep(RETRY_DELAY_BASE * (2 ** attempt))
+                            continue
+                        return None
                 
                 # Dismiss overlays
                 for sel in ["[data-ui='backdrop']", "[data-ui='cookie-consent'] button"]:
@@ -587,9 +283,9 @@ def extract_job_with_dom(job_url: str, account: str, shortcode: str):
                             page.wait_for_timeout(500)
                     except:
                         pass
-
+                
                 job_data = {"jobId": shortcode, "url": job_url, "account": account}
-
+                
                 # Title
                 title = None
                 for sel in ['h1[data-ui="job-title"]', 'h1[itemprop="title"]', 'h1']:
@@ -614,7 +310,7 @@ def extract_job_with_dom(job_url: str, account: str, shortcode: str):
                     return None
                 
                 job_data["title"] = title
-
+                
                 # Location
                 for sel in ['[data-ui="job-location"]', 'span[itemprop="addressLocality"]']:
                     try:
@@ -624,7 +320,7 @@ def extract_job_with_dom(job_url: str, account: str, shortcode: str):
                             break
                     except:
                         pass
-
+                
                 # Department
                 for sel in ['[data-ui="job-department"]']:
                     try:
@@ -634,7 +330,7 @@ def extract_job_with_dom(job_url: str, account: str, shortcode: str):
                             break
                     except:
                         pass
-
+                
                 # Type
                 for sel in ['[data-ui="job-type"]', 'span[itemprop="employmentType"]']:
                     try:
@@ -644,7 +340,7 @@ def extract_job_with_dom(job_url: str, account: str, shortcode: str):
                             break
                     except:
                         pass
-
+                
                 # Workplace
                 try:
                     el = page.query_selector('[data-ui="job-workplace"]')
@@ -652,70 +348,59 @@ def extract_job_with_dom(job_url: str, account: str, shortcode: str):
                         job_data["workplace"] = el.inner_text().strip()
                 except:
                     pass
-
+                
                 # Description - Get FULL HTML
                 description_found = False
-                for sel in ['[data-ui="job-description"]', 'div[itemprop="description"]', 'section[data-ui="job-description"]', 'div.description']:
+                for sel in ['[data-ui="job-description"]', 'div[itemprop="description"]', 
+                           'section[data-ui="job-description"]', 'div.description']:
                     try:
                         el = page.query_selector(sel)
                         if el:
                             html = el.inner_html()
                             if html and len(html) > 100:
                                 job_data["description"] = html
-                                logger.info(f"✓ Description: {len(html)} chars (FULL HTML)")
                                 description_found = True
                                 break
                     except:
                         continue
                 
-                # Fallback: Get entire job content if specific description not found
                 if not description_found:
                     try:
-                        # Try to get the entire job content area
-                        content_selectors = [
-                            'main',
-                            'article',
-                            '[role="main"]',
-                            'div[class*="content"]'
-                        ]
+                        content_selectors = ['main', 'article', '[role="main"]']
                         for sel in content_selectors:
                             el = page.query_selector(sel)
                             if el:
                                 html = el.inner_html()
                                 if html and len(html) > 500:
                                     job_data["description"] = html
-                                    logger.info(f"✓ Description (full content): {len(html)} chars")
-                                    description_found = True
                                     break
                     except:
                         pass
-
-                # Requirements - Get FULL HTML
-                for sel in ['[data-ui="job-requirements"]', 'section:has-text("Requirements")', 'div:has-text("Requirements")', 'section:has-text("Qualifications")']:
+                
+                # Requirements
+                for sel in ['[data-ui="job-requirements"]', 'section:has-text("Requirements")']:
                     try:
                         el = page.query_selector(sel)
                         if el:
                             html = el.inner_html()
                             if html and len(html) > 50:
                                 job_data["requirements"] = html
-                                logger.info(f"✓ Requirements: {len(html)} chars (FULL HTML)")
                                 break
                     except:
                         continue
-
-                # Benefits - Get FULL HTML
-                for sel in ['[data-ui="job-benefits"]', 'section:has-text("Benefits")', 'div:has-text("Benefits")', 'section:has-text("What we offer")']:
+                
+                # Benefits
+                for sel in ['[data-ui="job-benefits"]', 'section:has-text("Benefits")']:
                     try:
                         el = page.query_selector(sel)
                         if el:
                             html = el.inner_html()
                             if html and len(html) > 50:
                                 job_data["benefits"] = html
-                                logger.info(f"✓ Benefits: {len(html)} chars (FULL HTML)")
                                 break
                     except:
                         continue
-
+                
                 # JSON-LD
                 try:
                     script = page.query_selector('script[type="application/ld+json"]')
@@ -730,12 +415,13 @@ def extract_job_with_dom(job_url: str, account: str, shortcode: str):
                                 job_data["published"] = ld.get("datePosted")
                 except:
                     pass
-
+                
                 browser.close()
                 
                 has_content = bool(job_data.get("description") or job_data.get("location"))
                 
                 if has_content:
+                    global_rate_limiter.record_success(domain)
                     return job_data
                 else:
                     if attempt < MAX_RETRIES - 1:
@@ -744,28 +430,28 @@ def extract_job_with_dom(job_url: str, account: str, shortcode: str):
                     return job_data if title else None
                     
         except Exception as e:
+            logger.error(f"DOM extraction attempt {attempt + 1} failed: {e}")
             if attempt < MAX_RETRIES - 1:
                 time.sleep(RETRY_DELAY_BASE * (2 ** attempt))
                 continue
-    
-    return None
+            return None
+
 
 def extract_job_with_api(account: str, shortcode: str, job_url: str):
-    """Extract job from API - supports POST and GET"""
-    
+    """Extract job from API with rate limiting"""
     endpoints = {
         "v3": f"https://apply.workable.com/api/v3/accounts/{account}/jobs/{shortcode}",
         "v2": f"https://apply.workable.com/api/v2/accounts/{account}/jobs/{shortcode}",
     }
     
-    headers = {
+    domain = urlparse(job_url).netloc
+    headers = BrowserRotator.get_headers()
+    headers.update({
         "Accept": "application/json",
         "Content-Type": "application/json",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-    }
+    })
     
     for name, endpoint in endpoints.items():
-        # Try POST then GET
         for method in ["POST", "GET"]:
             try:
                 if method == "POST":
@@ -774,12 +460,21 @@ def extract_job_with_api(account: str, shortcode: str, job_url: str):
                     resp = requests.get(endpoint, headers=headers, timeout=15)
                 
                 if resp.status_code == 429:
-                    time.sleep(5)
-                    continue
+                    logger.warning(f"API rate limited (429)")
+                    global_rate_limiter.record_rate_limit(domain)
+                    raise HTTPException(
+                        status_code=429,
+                        detail={
+                            "error": "rate_limit_exceeded",
+                            "message": "Rate limited by target server",
+                            "retry_after_seconds": 900,  # 15 minutes
+                            "domain": domain
+                        }
+                    )
                 
                 if resp.status_code == 200:
                     d = resp.json()
-                    logger.info(f"✅ API {name} ({method}) SUCCESS")
+                    global_rate_limiter.record_success(domain)
                     
                     return {
                         "jobId": d.get("shortcode") or shortcode,
@@ -797,95 +492,66 @@ def extract_job_with_api(account: str, shortcode: str, job_url: str):
                         "requirements": d.get("requirements"),
                         "benefits": d.get("benefits"),
                     }
-                
+                    
                 elif resp.status_code in [404, 410]:
                     break
-                
-            except:
+                    
+            except HTTPException:
+                raise  # Re-raise HTTP exceptions
+            except Exception as e:
+                logger.debug(f"API {name} {method} failed: {e}")
                 continue
     
     return None
 
-# === ENDPOINTS ===
 
-@app.get("/get-job-links")
-def get_job_links(
-    url: str = Query(..., description="Workable board URL"),
-    days: int = Query(5, description="Get jobs from last N days (use 0 for all jobs)")
-):
-    """
-    Get job links with deduplication and country merging
-    - Tries POST/GET API first
-    - Falls back to DOM scraping
-    - Returns unique jobs by title with merged countries
-    
-    Set days=0 to get ALL jobs (no date filtering)
-    """
-    logger.info(f"\n{'='*80}")
-    if days == 0:
-        logger.info(f"🎯 GET LINKS: {url} (ALL JOBS)")
-    else:
-        logger.info(f"🎯 GET LINKS: {url} (last {days} days)")
-    logger.info(f"{'='*80}")
-    
-    try:
-        if is_lever_url(url):
-            links = get_links_from_lever_api(url, days=days)
-            if links:
-                return {"success": True, "total": len(links), "jobs": links, "method": "api"}
-
-        # Try API
-        links = get_links_from_api(url, days=days if days > 0 else 9999)  # Use 9999 days for "all"
-        
-        if links:
-            return {"success": True, "total": len(links), "jobs": links, "method": "api"}
-        
-        # Try DOM
-        logger.info("API failed, trying DOM...")
-        dom_links = get_links_from_dom_v5(url)
-        
-        if dom_links:
-            # Convert to same format as API
-            jobs = [{"url": link, "method": "dom"} for link in dom_links]
-            return {"success": True, "total": len(jobs), "jobs": jobs, "method": "dom"}
-        
-        # No jobs
-        return {"success": True, "total": 0, "jobs": [], "note": "No jobs found"}
-        
-    except Exception as e:
-        logger.error(f"Error: {e}")
-        return {"success": False, "total": 0, "jobs": [], "error": str(e)}
+# ============================================================================
+# API ENDPOINTS
+# ============================================================================
 
 @app.get("/get-job-details")
 def get_job_details(url: str = Query(..., description="Workable or Lever job URL")):
-    """Get full job details - DOM first, then API fallback"""
+    """
+    Get full job details - OPTIMIZED FOR N8N
+    
+    This endpoint handles rate limiting automatically and returns 429 errors
+    when n8n should retry later (n8n will handle the retry automatically)
+    """
     logger.info(f"\n🎯 GET DETAILS: {url}")
     
     try:
+        domain = urlparse(url).netloc
+        
+        # CRITICAL: Wait for rate limit before processing
+        wait_for_rate_limit(domain, max_wait=300)
+        
+        # Check if Lever URL
         if is_lever_url(url):
             api_result = extract_job_with_lever_api(url)
             if api_result and api_result.get("title"):
                 api_result["method"] = "api"
+                global_rate_limiter.record_success(domain)
                 return {"success": True, "job": api_result}
             return {"success": False, "error": "Lever API failed", "url": url}
-
+        
+        # Parse Workable URL
         account, shortcode = _parse_workable_url(url)
         
-        # Try DOM
+        # Try DOM first
         dom_result = extract_job_with_dom(url, account, shortcode)
         if dom_result and dom_result.get("title"):
             dom_result["method"] = "dom"
             return {"success": True, "job": dom_result}
         
         # Try API
-        time.sleep(2)
+        time.sleep(random.uniform(2, 4))
         api_result = extract_job_with_api(account, shortcode, url)
         if api_result and api_result.get("title"):
             api_result["method"] = "api"
             return {"success": True, "job": api_result}
         
-        # Final DOM
-        time.sleep(3)
+        # Final DOM attempt
+        time.sleep(random.uniform(3, 5))
         final_result = extract_job_with_dom(url, account, shortcode)
         if final_result and final_result.get("title"):
             final_result["method"] = "dom_final"
@@ -893,29 +559,85 @@ def get_job_details(url: str = Query(..., description="Workable or Lever job URL
         
         return {"success": False, "error": "All methods failed", "url": url}
         
+    except HTTPException:
+        raise  # Let FastAPI handle 429 errors
     except Exception as e:
+        logger.error(f"Error: {e}")
         return {"success": False, "error": str(e), "url": url}
+
+
+@app.get("/rate-limit-status")
+def rate_limit_status(domain: str = Query("apply.workable.com", description="Domain to check")):
+    """
+    Check current rate limit status for a domain
+    Useful for n8n to check before starting a batch
+    """
+    stats = global_rate_limiter.get_stats(domain)
+    return {
+        "success": True,
+        "stats": stats,
+        "can_proceed": not stats["in_cooldown"]
+    }
+
+
+@app.post("/reset-rate-limit")
+def reset_rate_limit(domain: str = Query(..., description="Domain to reset")):
+    """
+    Reset rate limit counters for a domain
+    Use this if you want to manually clear cooldowns
+    """
+    if domain in global_rate_limiter.domain_cooldowns:
+        del global_rate_limiter.domain_cooldowns[domain]
+    
+    global_rate_limiter.consecutive_errors[domain] = 0
+    global_rate_limiter.request_times[domain] = []
+    
+    return {
+        "success": True,
+        "message": f"Rate limit reset for {domain}"
+    }
+
 
 @app.get("/health")
 def health():
-    return {"status": "healthy", "version": "5.0-production"}
+    """Health check endpoint"""
+    return {
+        "status": "healthy",
+        "version": "7.0-n8n-optimized",
+        "rate_limiter": {
+            "max_requests_per_5min": global_rate_limiter.max_requests_per_5min,
+            "min_delay_seconds": global_rate_limiter.min_delay_seconds,
+            "max_delay_seconds": global_rate_limiter.max_delay_seconds,
+            "cooldown_minutes": global_rate_limiter.cooldown_minutes
+        }
+    }
+
 
 @app.get("/")
 def root():
+    """API info"""
     return {
-        "name": "Workable + Lever Scraper v5 - Production",
-        "version": "5.0",
-        "improvements": [
-            "✨ POST API support (80%+ success rate boost)",
-            "🧲 Lever API support",
-            "🔄 Job deduplication by title",
-            "🌍 Country/location merging",
-            "🍪 Cloudflare cookie support",
-            "📅 Configurable date range (default 5 days)",
-            "🎯 3-strategy DOM fallback"
+        "name": "Workable + Lever Scraper - N8N Optimized",
+        "version": "7.0",
+        "optimizations": [
+            "🔄 Global rate limiter (persists across n8n requests)",
+            "⏱️  5-10 second delays between requests",
+            "🛡️  Max 8 requests per 5 minutes",
+            "🚫 Auto 15-minute cooldowns on rate limits",
+            "⚠️  Returns 429 errors for n8n to handle retries",
+            "📊 Rate limit status endpoint",
+            "🎭 Browser fingerprint rotation"
         ],
+        "for_n8n": {
+            "main_endpoint": "/get-job-details?url=JOB_URL",
+            "check_status": "/rate-limit-status?domain=apply.workable.com",
+            "handle_429": "n8n should wait and retry based on retry_after_seconds",
+            "recommended_workflow": "Add 'Wait' node in n8n between HTTP requests"
+        },
         "endpoints": {
-            "/get-job-links": "GET ?url=BOARD_URL&days=5 → Unique jobs with merged countries",
-            "/get-job-details": "GET ?url=JOB_URL → Full job details"
+            "/get-job-details": "GET ?url=JOB_URL → Full job details",
+            "/rate-limit-status": "GET ?domain=DOMAIN → Check rate limit status",
+            "/reset-rate-limit": "POST ?domain=DOMAIN → Reset rate limits",
+            "/health": "GET → Health check"
         }
     }
