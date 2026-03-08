@@ -3,6 +3,8 @@ from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse
 import logging
 import requests
+import re
+from bs4 import BeautifulSoup
 
 logger = logging.getLogger(__name__)
 
@@ -103,9 +105,8 @@ def get_links_from_lever_api(board_url: str, days: int = 5):
         logger.error(f"Lever API error: {exc}")
         return []
 
-
 def extract_job_with_lever_api(job_url: str):
-    """Extract Lever job details from API."""
+    """Extract Lever job details from API, fall back to HTML if API fails."""
     try:
         company, posting_id = parse_lever_job_url(job_url)
     except ValueError as exc:
@@ -120,40 +121,76 @@ def extract_job_with_lever_api(job_url: str):
 
     try:
         resp = requests.get(api_url, headers=headers, timeout=20)
-        if resp.status_code != 200:
-            logger.warning(f"Lever API failed: {resp.status_code}")
+        if resp.status_code == 200:
+            data = resp.json()
+            created_at = data.get("createdAt")
+            created_dt = (
+                datetime.fromtimestamp(created_at / 1000, tz=timezone.utc)
+                if created_at else None
+            )
+            categories = data.get("categories", {}) if isinstance(data.get("categories"), dict) else {}
+            workplace_type = data.get("workplaceType") or ""
+            return {
+                "jobId": data.get("id") or posting_id,
+                "url": data.get("hostedUrl") or job_url,
+                "account": company,
+                "title": data.get("text"),
+                "department": categories.get("team"),
+                "published": created_dt.isoformat() if created_dt else "",
+                "location": categories.get("location"),
+                "type": categories.get("commitment"),
+                "workplace": workplace_type,
+                "remote": workplace_type.lower() == "remote",
+                "country": data.get("country"),
+                "description": data.get("description"),
+                "descriptionPlain": data.get("descriptionPlain"),
+                "lists": data.get("lists"),
+            }
+
+        logger.warning(f"Lever API failed: {resp.status_code} — falling back to HTML")
+
+        # HTML fallback
+        html_resp = requests.get(job_url, headers={"User-Agent": headers["User-Agent"]}, timeout=20)
+        if html_resp.status_code != 200:
+            logger.warning(f"Lever HTML fetch failed: {html_resp.status_code}")
             return None
 
-        data = resp.json()
-        created_at = data.get("createdAt")
-        created_dt = (
-            datetime.fromtimestamp(created_at / 1000, tz=timezone.utc)
-            if created_at
-            else None
-        )
-        categories = data.get("categories", {}) if isinstance(data.get("categories"), dict) else {}
-        workplace_type = data.get("workplaceType") or ""
+        soup = BeautifulSoup(html_resp.text, "html.parser")
+
+        # title
+        title = None
+        h2 = soup.select_one("h2.posting-headline")
+        if h2:
+            title = h2.get_text(" ", strip=True)
+        if not title and soup.title:
+            title = soup.title.get_text(strip=True)
+
+        # location / team / commitment often appear in categories
+        cats = soup.select("div.posting-categories > div.posting-category")
+        cat_map = {}
+        for c in cats:
+            label = c.select_one("h4")
+            value = c.select_one("p")
+            if label and value:
+                cat_map[label.get_text(strip=True).lower()] = value.get_text(" ", strip=True)
+
+        # description
+        desc = soup.select_one("div.posting")
+        description_html = str(desc) if desc else ""
 
         return {
-            "jobId": data.get("id") or posting_id,
-            "url": data.get("hostedUrl") or job_url,
+            "jobId": posting_id,
+            "url": job_url,
             "account": company,
-            "title": data.get("text"),
-            "department": categories.get("team"),
-            "published": created_dt.isoformat() if created_dt else "",
-            "location": categories.get("location"),
-            "type": categories.get("commitment"),
-            "workplace": workplace_type,
-            "remote": workplace_type.lower() == "remote",
-            "country": data.get("country"),
-            "description": data.get("description"),
-            "descriptionPlain": data.get("descriptionPlain"),
-            "opening": data.get("opening"),
-            "openingPlain": data.get("openingPlain"),
-            "descriptionBody": data.get("descriptionBody"),
-            "descriptionBodyPlain": data.get("descriptionBodyPlain"),
-            "lists": data.get("lists"),
+            "title": title,
+            "department": cat_map.get("team"),
+            "location": cat_map.get("location"),
+            "type": cat_map.get("commitment"),
+            "workplace": cat_map.get("workplace type"),
+            "description": description_html,
+            "method": "html_fallback",
         }
+
     except Exception as exc:
-        logger.error(f"Lever API error: {exc}")
+        logger.error(f"Lever extract error: {exc}")
         return None
