@@ -180,12 +180,14 @@ VIEWPORTS = [
     {'width': 1536, 'height': 864},
 ]
 
-def new_stealth_page(p):
+def new_stealth_page(p, use_proxy: bool | None = None):
     """
     Launch a stealth browser routed through Bright Data proxy.
     Falls back to direct connection if credentials not set.
     Always call browser.close() after use.
     """
+    if use_proxy is None:
+        use_proxy = USE_BRIGHT_DATA
     launch_args = [
         '--disable-blink-features=AutomationControlled',
         '--disable-dev-shm-usage',
@@ -212,7 +214,7 @@ def new_stealth_page(p):
         outerdimensions=True,
     )
 
-    if USE_BRIGHT_DATA:
+    if use_proxy:
         # Route browser traffic through Bright Data residential proxy
         logger.info(f"🌐 Using Bright Data proxy")
         browser = p.chromium.launch(
@@ -229,7 +231,10 @@ def new_stealth_page(p):
             http_credentials={"username": f"{BD_USERNAME}-session-{random.randint(1000000,9999999)}", "password": BD_PASSWORD}
         )
     else:
-        logger.warning("⚠️  No Bright Data credentials - using direct connection")
+        if USE_BRIGHT_DATA:
+            logger.warning("⚠️  Bright Data disabled for this attempt - using direct connection")
+        else:
+            logger.warning("⚠️  No Bright Data credentials - using direct connection")
         browser = p.chromium.launch(headless=True, args=launch_args)
         context = browser.new_context(
             user_agent=random.choice(USER_AGENTS),
@@ -294,6 +299,80 @@ def _dismiss_overlays(page):
         except:
             pass
 
+def _scroll_and_collect_links(page, base_url: str, max_scrolls: int = 6) -> list:
+    links = []
+    for _ in range(max_scrolls):
+        try:
+            for link in page.query_selector_all("a[href]"):
+                href = link.get_attribute("href")
+                if href and "/j/" in href and len(href.split("/j/")[1].split("/")[0]) > 5:
+                    full_url = urljoin(base_url, href)
+                    if full_url not in links:
+                        links.append(full_url)
+            if links:
+                return links
+        except Exception:
+            pass
+        try:
+            page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+        except Exception:
+            pass
+        page.wait_for_timeout(random.randint(1500, 2500))
+    return links
+
+
+def _click_load_more(page, selectors: list[str]) -> bool:
+    try:
+        page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+    except Exception:
+        pass
+    page.wait_for_timeout(random.randint(800, 1200))
+
+    for sel in selectors:
+        try:
+            btn = page.query_selector(sel)
+            if btn and btn.is_visible():
+                btn.scroll_into_view_if_needed()
+                page.wait_for_timeout(random.randint(500, 900))
+                try:
+                    btn.click(force=True, timeout=5000)
+                except Exception:
+                    try:
+                        page.evaluate("(s) => { const b = document.querySelector(s); if (b) b.click(); }", sel)
+                    except Exception:
+                        pass
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _links_from_workable_results(results: list, base_url: str) -> list:
+    links = []
+    for job in results or []:
+        if not isinstance(job, dict):
+            continue
+        job_url = job.get("url") or job.get("application_url") or job.get("apply_url")
+        if not job_url:
+            shortcode = job.get("shortcode") or job.get("code")
+            if shortcode:
+                job_url = urljoin(base_url if base_url.endswith("/") else base_url + "/", f"j/{shortcode}/")
+        if job_url and job_url not in links:
+            links.append(job_url)
+    return links
+
+
+def _account_from_board_url(board_url: str) -> str | None:
+    try:
+        u = urlparse(board_url)
+        host = (u.netloc or "").lower()
+        parts = [p for p in (u.path or "").strip("/").split("/") if p]
+        if host == "apply.workable.com" and parts:
+            return parts[0]
+    except Exception:
+        return None
+    return None
+
 def _extract_jobboard_initial_state(html: str):
     """
     Extract window.jobBoard.initialState as JSON.
@@ -342,6 +421,11 @@ def _extract_jobboard_initial_state(html: str):
 def get_links_from_embedded_jobboard(board_url: str) -> list:
     """Get job links from embedded window.jobBoard.initialState JSON (Jobs by Workable)"""
     try:
+        host = urlparse(board_url).netloc.lower()
+        if host != "jobs.workable.com":
+            logger.info(f"Embedded jobboard skipped (host={host})")
+            return []
+
         headers = {
             "User-Agent": random.choice(USER_AGENTS),
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -438,162 +522,285 @@ def get_links_from_dom_stealth(board_url: str) -> list:
 
     for attempt in range(MAX_RETRIES):
         all_links = []
+        proxy_blocked = False
         try:
             logger.info(f"🥷 Stealth DOM attempt {attempt + 1}")
 
-            with sync_playwright() as p:
-                browser, page = new_stealth_page(p)
+            proxy_modes = [True, False] if USE_BRIGHT_DATA else [False]
+            for use_proxy in proxy_modes:
+                if not use_proxy and not proxy_blocked:
+                    break
 
-                try:
-                    page.goto(clean_url, wait_until="domcontentloaded", timeout=40000)
-                except PlaywrightTimeout:
-                    logger.warning("   Navigation timeout, continuing...")
+                with sync_playwright() as p:
+                    browser, page = new_stealth_page(p, use_proxy=use_proxy)
+                    api_payloads = []
 
-                page.wait_for_timeout(random.randint(3000, 5000))
-                try:
-                    page.wait_for_load_state("networkidle", timeout=10000)
-                except:
-                    pass
-                page.wait_for_timeout(random.randint(1000, 2000))
-
-                _dismiss_overlays(page)
-
-                # Strategy 1: Job element selectors
-                job_selectors = [
-                    "li[data-ui='job']",
-                    "li[data-ui='job-opening']",
-                    "li[data-ui='job-board-position']",
-                    ".job-item",
-                    "[role='listitem']",
-                    "div[data-ui='job-card']"
-                ]
-
-                job_elements = []
-                selected_selector = None
-                for selector in job_selectors:
-                    try:
-                        elements = page.query_selector_all(selector)
-                        if elements:
-                            job_elements = elements
-                            selected_selector = selector
-                            logger.info(f"   Found {len(elements)} with: {selector}")
-                            break
-                    except:
-                        continue
-
-                # Strategy 2: Scan all /j/ links
-                if not job_elements:
-                    logger.info("   Scanning all /j/ links...")
-                    try:
-                        for link in page.query_selector_all("a[href]"):
-                            href = link.get_attribute("href")
-                            if href and '/j/' in href and len(href.split('/j/')[1].split('/')[0]) > 5:
-                                full_url = urljoin(clean_url, href)
-                                if full_url not in all_links:
-                                    all_links.append(full_url)
-                        if all_links:
-                            logger.info(f"   ✓ Found {len(all_links)} links")
-                    except Exception as e:
-                        logger.debug(f"   Link scan error: {e}")
-
-                # Strategy 3: Check for no jobs
-                if not job_elements and not all_links:
-                    page_text = page.inner_text('body').lower()
-                    if any(x in page_text for x in ["no open positions", "no positions available", "currently no openings", "not hiring"]):
-                        logger.info("   ℹ️  No open positions")
-                        browser.close()
-                        return []
-
-                # Process job elements
-                if job_elements:
-                    for item in job_elements:
+                    def _capture_api(resp):
+                        nonlocal proxy_blocked
                         try:
-                            link_el = None
-                            for s in ["a[aria-labelledby]", "a[href*='/j/']", "a"]:
-                                link_el = item.query_selector(s)
-                                if link_el:
-                                    break
-                            if not link_el:
-                                continue
-                            href = link_el.get_attribute("href")
-                            if not href or '/j/' not in href:
-                                continue
-                            posted_el = item.query_selector("[data-ui='job-posted']")
-                            if posted_el:
-                                match = re.search(r"(\d+)\s+day", posted_el.inner_text().strip())
-                                if match and int(match.group(1)) > MAX_DAYS:
-                                    continue
-                            full_url = urljoin(clean_url, href)
-                            if full_url not in all_links:
-                                all_links.append(full_url)
+                            url = resp.url
+                            if "apply.workable.com/api/" not in url:
+                                return
+                            if resp.status == 402:
+                                proxy_blocked = True
+                                return
+                            if resp.status != 200:
+                                return
+                            data = resp.json()
+                            if isinstance(data, dict) and data.get("results"):
+                                api_payloads.append(data)
+                        except Exception:
+                            return
+
+                    page.on("response", _capture_api)
+
+                    try:
+                        page.goto(clean_url, wait_until="domcontentloaded", timeout=40000)
+                    except PlaywrightTimeout:
+                        logger.warning("   Navigation timeout, continuing...")
+
+                    page.wait_for_timeout(random.randint(3000, 5000))
+                    try:
+                        page.wait_for_load_state("networkidle", timeout=10000)
+                    except:
+                        pass
+                    page.wait_for_timeout(random.randint(1000, 2000))
+
+                    _dismiss_overlays(page)
+
+                    # Quick sanity check for block pages
+                    try:
+                        title = (page.title() or "").lower()
+                        body = (page.inner_text("body") or "").lower()
+                        if any(x in title for x in ["just a moment", "access denied", "attention required"]) or \
+                           any(x in body for x in ["just a moment", "access denied", "captcha"]):
+                            logger.warning("   Possible block page detected")
+                    except:
+                        pass
+
+                    # Strategy 1: Job element selectors
+                    job_selectors = [
+                        "li[data-ui='job']",
+                        "li[data-ui='job-opening']",
+                        "li[data-ui='job-board-position']",
+                        ".job-item",
+                        "[role='listitem']",
+                        "div[data-ui='job-card']"
+                    ]
+
+                    job_elements = []
+                    selected_selector = None
+                    for selector in job_selectors:
+                        try:
+                            elements = page.query_selector_all(selector)
+                            if elements:
+                                job_elements = elements
+                                selected_selector = selector
+                                logger.info(f"   Found {len(elements)} with: {selector}")
+                                break
                         except:
                             continue
 
-                    logger.info(f"   Collected {len(all_links)} jobs")
+                    # Strategy 2: Scan all /j/ links
+                    if not job_elements:
+                        logger.info("   Scanning all /j/ links...")
+                        try:
+                            for link in page.query_selector_all("a[href]"):
+                                href = link.get_attribute("href")
+                                if href and '/j/' in href and len(href.split('/j/')[1].split('/')[0]) > 5:
+                                    full_url = urljoin(clean_url, href)
+                                    if full_url not in all_links:
+                                        all_links.append(full_url)
+                            if all_links:
+                                logger.info(f"   ✓ Found {len(all_links)} links")
+                        except Exception as e:
+                            logger.debug(f"   Link scan error: {e}")
 
-                    # Load More
-                    load_more_selectors = [
-                        "button[data-ui='load-more-button']",
-                        "button:has-text('Show more')",
-                        "button:has-text('Load more')",
-                        "button:has-text('View more jobs')"
-                    ]
+                    # Strategy 2b: Scroll to trigger lazy loading and re-scan
+                    if not job_elements and not all_links:
+                        logger.info("   Scrolling to load jobs...")
+                        all_links = _scroll_and_collect_links(page, clean_url)
+                        if all_links:
+                            logger.info(f"   ✓ Found {len(all_links)} links after scroll")
 
-                    consecutive_no_change = 0
-                    for _ in range(20):
-                        btn_found = False
-                        for btn_sel in load_more_selectors:
+                    # Strategy 2c: Use captured API responses from the browser session
+                    if not job_elements and not all_links and api_payloads:
+                        logger.info("   Using in-browser API responses...")
+                        for payload in api_payloads:
+                            results = payload.get("results", [])
+                            links = _links_from_workable_results(results, clean_url)
+                            for l in links:
+                                if l not in all_links:
+                                    all_links.append(l)
+                        if all_links:
+                            logger.info(f"   ✓ Found {len(all_links)} links from API responses")
+
+                    # Strategy 2d: In-browser fetch to Workable API (still DOM session)
+                    if not job_elements and not all_links:
+                        account = _account_from_board_url(clean_url)
+                        if account:
                             try:
-                                btn = page.query_selector(btn_sel)
-                                if btn and btn.is_visible():
-                                    btn_found = True
-                                    btn.scroll_into_view_if_needed()
-                                    page.wait_for_timeout(random.randint(500, 1000))
-                                    btn.click(force=True, timeout=5000)
-                                    page.wait_for_timeout(random.randint(5000, 8000))
-
-                                    before = len(all_links)
-                                    new_elements = page.query_selector_all(selected_selector)
-                                    all_links = []
-                                    for item in new_elements:
-                                        try:
-                                            link_el = None
-                                            for s in ["a[aria-labelledby]", "a[href*='/j/']", "a"]:
-                                                link_el = item.query_selector(s)
-                                                if link_el:
-                                                    break
-                                            if link_el:
-                                                href = link_el.get_attribute("href")
-                                                if href and '/j/' in href:
-                                                    full_url = urljoin(clean_url, href)
-                                                    if full_url not in all_links:
-                                                        all_links.append(full_url)
-                                        except:
-                                            continue
-                                    job_elements = new_elements
-
-                                    if len(all_links) > before:
-                                        logger.info(f"   ✓ {len(all_links) - before} new jobs (total: {len(all_links)})")
-                                        consecutive_no_change = 0
-                                    else:
-                                        consecutive_no_change += 1
-                                        if consecutive_no_change >= 3:
+                                logger.info("   Using in-browser fetch to API...")
+                                api_url = f"https://apply.workable.com/api/v3/accounts/{account}/jobs"
+                                payload = {
+                                    "query": "",
+                                    "location": [],
+                                    "department": [],
+                                    "worktype": [],
+                                    "remote": [],
+                                }
+                                next_page = None
+                                max_pages = 5
+                                for page_idx in range(1, max_pages + 1):
+                                    if next_page:
+                                        payload["nextPage"] = next_page
+                                    data = page.evaluate(
+                                        """
+(async ({ apiUrl, payload }) => {
+  try {
+    const res = await fetch(apiUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Accept': 'application/json',
+        'X-Requested-With': 'XMLHttpRequest'
+      },
+      credentials: 'include',
+      body: JSON.stringify(payload)
+    });
+    const contentType = res.headers.get('content-type') || '';
+    const text = await res.text();
+    let json = null;
+    if (contentType.includes('application/json')) {
+      try { json = JSON.parse(text); } catch (e) {}
+    }
+    return {
+      ok: res.ok,
+      status: res.status,
+      contentType,
+      json,
+      bodySnippet: text.slice(0, 200)
+    };
+  } catch (e) {
+    return { ok: false, status: 0, error: String(e) };
+  }
+})
+""",
+                                        {"apiUrl": api_url, "payload": payload},
+                                    )
+                                    if isinstance(data, dict) and data.get("status") == 402:
+                                        proxy_blocked = True
+                                        logger.info(f"   In-browser fetch status=402 ok=False")
+                                        break
+                                    if isinstance(data, dict) and data.get("json") and data["json"].get("results"):
+                                        links = _links_from_workable_results(data["json"].get("results"), clean_url)
+                                        if links:
+                                            all_links.extend([l for l in links if l not in all_links])
+                                            logger.info(f"   ✓ Page {page_idx}: {len(links)} links")
+                                        next_page = data["json"].get("nextPage") or data["json"].get("nextPageToken")
+                                        if not next_page:
                                             break
-                                    break
+                                    else:
+                                        logger.info(
+                                            f"   In-browser fetch status={data.get('status')} "
+                                            f"ok={data.get('ok')} contentType={data.get('contentType')}"
+                                        )
+                                        break
                             except Exception as e:
-                                logger.debug(f"   Load more error: {e}")
+                                logger.debug(f"   In-browser fetch failed: {e}")
+
+                    # Strategy 3: Check for no jobs
+                    if not job_elements and not all_links:
+                        page_text = page.inner_text('body').lower()
+                        if any(x in page_text for x in ["no open positions", "no positions available", "currently no openings", "not hiring"]):
+                            logger.info("   ℹ️  No open positions")
+                            browser.close()
+                            return []
+
+                    # Process job elements
+                    if job_elements:
+                        for item in job_elements:
+                            try:
+                                link_el = None
+                                for s in ["a[aria-labelledby]", "a[href*='/j/']", "a"]:
+                                    link_el = item.query_selector(s)
+                                    if link_el:
+                                        break
+                                if not link_el:
+                                    continue
+                                href = link_el.get_attribute("href")
+                                if not href or '/j/' not in href:
+                                    continue
+                                posted_el = item.query_selector("[data-ui='job-posted']")
+                                if posted_el:
+                                    match = re.search(r"(\d+)\s+day", posted_el.inner_text().strip())
+                                    if match and int(match.group(1)) > MAX_DAYS:
+                                        continue
+                                full_url = urljoin(clean_url, href)
+                                if full_url not in all_links:
+                                    all_links.append(full_url)
+                            except:
                                 continue
 
-                        if not btn_found or consecutive_no_change >= 3:
-                            break
+                        logger.info(f"   Collected {len(all_links)} jobs")
 
-                browser.close()
+                        # Load More
+                        load_more_selectors = [
+                            "button[data-ui='load-more-button']",
+                            "button:has-text('Show more')",
+                            "button:has-text('Load more')",
+                            "button:has-text('View more jobs')"
+                        ]
+
+                        consecutive_no_change = 0
+                        for _ in range(20):
+                            clicked = _click_load_more(page, load_more_selectors)
+                            if not clicked:
+                                logger.info("   Load more button not found/visible")
+                                break
+
+                            page.wait_for_timeout(random.randint(4000, 7000))
+
+                            before = len(all_links)
+                            new_elements = page.query_selector_all(selected_selector)
+                            all_links = []
+                            for item in new_elements:
+                                try:
+                                    link_el = None
+                                    for s in ["a[aria-labelledby]", "a[href*='/j/']", "a"]:
+                                        link_el = item.query_selector(s)
+                                        if link_el:
+                                            break
+                                    if link_el:
+                                        href = link_el.get_attribute("href")
+                                        if href and '/j/' in href:
+                                            full_url = urljoin(clean_url, href)
+                                            if full_url not in all_links:
+                                                all_links.append(full_url)
+                                except:
+                                    continue
+                            job_elements = new_elements
+
+                            if len(all_links) > before:
+                                logger.info(f"   ✓ {len(all_links) - before} new jobs (total: {len(all_links)})")
+                                consecutive_no_change = 0
+                            else:
+                                consecutive_no_change += 1
+                                if consecutive_no_change >= 3:
+                                    break
+
+                    browser.close()
 
                 if all_links:
                     logger.info(f"✅ Stealth DOM: {len(all_links)} links")
                     return list(set(all_links))
-                elif attempt < MAX_RETRIES - 1:
-                    time.sleep(RETRY_DELAY_BASE * (2 ** attempt))
+
+                if use_proxy and proxy_blocked:
+                    logger.warning("   Proxy returned 402 in browser session, retrying DOM direct...")
+                    continue
+
+            if attempt < MAX_RETRIES - 1:
+                time.sleep(RETRY_DELAY_BASE * (2 ** attempt))
 
         except Exception as e:
             logger.error(f"Stealth DOM attempt {attempt + 1} failed: {e}")
@@ -647,6 +854,8 @@ def get_links_from_api(board_url: str, days: int = 5) -> list:
         cutoff_date = datetime.now(timezone.utc) - timedelta(days=days)
         all_jobs = []
 
+        best_jobs = []
+        best_incomplete = False
         for method in ["POST", "GET"]:
             try:
                 logger.info(f"   Trying {method}...")
@@ -660,30 +869,35 @@ def get_links_from_api(board_url: str, days: int = 5) -> list:
 
                     proxies = _bd_requests_proxies() if USE_BRIGHT_DATA else {}
 
-                    if method == "POST":
-                        payload = {"query": "", "location": [], "department": [], "worktype": [], "remote": []}
-                        if next_page:
-                            payload["nextPage"] = next_page
-                        resp = requests.post(
-                            api_url,
-                            json=payload,
-                            headers=headers,
-                            timeout=20,
-                            proxies=proxies,
-                            verify=REQUESTS_VERIFY,
-                        )
-                    else:
+                    def _do_request(use_proxies: dict):
+                        if method == "POST":
+                            payload = {"query": "", "location": [], "department": [], "worktype": [], "remote": []}
+                            if next_page:
+                                payload["nextPage"] = next_page
+                            return requests.post(
+                                api_url,
+                                json=payload,
+                                headers=headers,
+                                timeout=20,
+                                proxies=use_proxies,
+                                verify=REQUESTS_VERIFY,
+                            )
                         params = {"limit": 50}
                         if next_page:
                             params["nextPage"] = next_page
-                        resp = requests.get(
+                        return requests.get(
                             api_url,
                             params=params,
                             headers=headers,
                             timeout=20,
-                            proxies=proxies,
+                            proxies=use_proxies,
                             verify=REQUESTS_VERIFY,
                         )
+
+                    resp = _do_request(proxies)
+                    if USE_BRIGHT_DATA and resp.status_code in {402, 403, 407}:
+                        logger.warning(f"   Proxy returned {resp.status_code}, retrying direct...")
+                        resp = _do_request({})
 
                     if resp.status_code == 429:
                         logger.warning("   API rate limited")
@@ -720,22 +934,28 @@ def get_links_from_api(board_url: str, days: int = 5) -> list:
                     if not page_has_recent and page_num > 1:
                         break
 
-                    next_page = data.get("nextPage")
+                    next_page = data.get("nextPage") or data.get("nextPageToken")
                     if not next_page:
                         break
 
                     time.sleep(random.uniform(1, 2))
 
-                if all_jobs and not incomplete:
-                    logger.info(f"✅ API {method}: {len(all_jobs)} jobs")
+                if all_jobs:
+                    logger.info(
+                        f"✅ API {method}: {len(all_jobs)} jobs"
+                        + (" (incomplete pagination)" if incomplete else "")
+                    )
+                    best_jobs = all_jobs
+                    best_incomplete = incomplete
                     break
 
             except Exception as e:
                 logger.warning(f"   {method} error: {e}")
                 continue
 
-        if not all_jobs:
+        if not best_jobs:
             return []
+        all_jobs = best_jobs
 
         # Filter by date
         filtered = []
@@ -995,22 +1215,28 @@ def extract_job_with_api(account: str, shortcode: str, job_url: str):
     for name, endpoint in endpoints.items():
         for method in ["POST", "GET"]:
             try:
-                resp = requests.post(
-                    endpoint,
-                    json={},
-                    headers=headers,
-                    timeout=15,
-                    proxies=proxies,
-                    verify=REQUESTS_VERIFY,
-                ) \
-                    if method == "POST" else \
-                    requests.get(
+                def _do_request(use_proxies: dict):
+                    if method == "POST":
+                        return requests.post(
+                            endpoint,
+                            json={},
+                            headers=headers,
+                            timeout=15,
+                            proxies=use_proxies,
+                            verify=REQUESTS_VERIFY,
+                        )
+                    return requests.get(
                         endpoint,
                         headers=headers,
                         timeout=15,
-                        proxies=proxies,
+                        proxies=use_proxies,
                         verify=REQUESTS_VERIFY,
                     )
+
+                resp = _do_request(proxies)
+                if USE_BRIGHT_DATA and resp.status_code in {402, 403, 407}:
+                    logger.warning(f"   Proxy returned {resp.status_code}, retrying direct...")
+                    resp = _do_request({})
 
                 if resp.status_code == 429:
                     time.sleep(5)
@@ -1116,8 +1342,7 @@ def get_job_details(url: str = Query(..., description="Workable or Lever job URL
                 return {"success": True, "job": result}
             return {"success": False, "error": "Lever API failed", "url": url}
 
-        account, shortcode = _parse_workable_url(url)
-
+        account, shortcode, _ = _parse_workable_url(url)
         # 1st: Stealth DOM
         result = extract_job_with_dom_stealth(url, account, shortcode)
         if result and result.get("title"):
