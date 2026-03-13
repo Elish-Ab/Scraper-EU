@@ -1,9 +1,10 @@
 fastapi
-uvicorn
+uvicorn[standard]
 playwright
+playwright-stealth
 requests
 beautifulsoup4
+lxml
 pydantic
 httpx
-dotenv
-
+python-dotenv
