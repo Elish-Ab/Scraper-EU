@@ -5,8 +5,7 @@ load_dotenv()
 from fastapi import FastAPI, Query, HTTPException
 from urllib.parse import urljoin, urlparse
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
-from playwright_stealth.core import StealthConfig
-from playwright_stealth import stealth_sync
+from playwright_stealth import StealthConfig
 import requests
 from datetime import datetime, timedelta, timezone
 import re
@@ -188,14 +187,6 @@ def new_stealth_page(p, use_proxy: bool | None = None):
         '--disable-gpu',
     ]
 
-    stealth_config = StealthConfig(
-        webdriver=True, chrome_app=True, chrome_csi=True, chrome_load_times=True,
-        chrome_runtime=True, iframe_content_window=True, media_codecs=True,
-        navigator_hardware_concurrency=True, navigator_languages=True,
-        navigator_permissions=True, navigator_plugins=True, navigator_user_agent=True,
-        navigator_vendor=True, webgl_vendor=True, outerdimensions=True,
-    )
-
     if use_proxy:
         logger.info(f"🌐 Using Bright Data proxy")
         browser = p.chromium.launch(
@@ -214,10 +205,6 @@ def new_stealth_page(p, use_proxy: bool | None = None):
             }
         )
     else:
-        if USE_BRIGHT_DATA:
-            logger.warning("⚠️  Bright Data disabled for this attempt - using direct connection")
-        else:
-            logger.warning("⚠️  No Bright Data credentials - using direct connection")
         browser = p.chromium.launch(headless=True, args=launch_args)
         context = browser.new_context(
             user_agent=random.choice(USER_AGENTS),
@@ -227,9 +214,8 @@ def new_stealth_page(p, use_proxy: bool | None = None):
         )
 
     page = context.new_page()
-    stealth_sync(page, stealth_config)
+    stealth_sync(page)   # no StealthConfig, applies all defaults
     return browser, page
-
 
 # ============================================================================
 # HELPERS
