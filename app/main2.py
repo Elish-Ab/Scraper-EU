@@ -258,7 +258,7 @@ def _parse_workable_url(job_url: str):
 def _is_job_within_range(pub_str: str, since_dt: datetime) -> bool:
     """Return True if the job's published date is >= since_dt."""
     if not pub_str or not since_dt:
-        return True
+        return True  # no filter → include everything
     try:
         if pub_str.endswith("Z"):
             pub_str = pub_str[:-1] + "+00:00"
@@ -267,7 +267,7 @@ def _is_job_within_range(pub_str: str, since_dt: datetime) -> bool:
             pub_date = pub_date.replace(tzinfo=timezone.utc)
         return pub_date >= since_dt
     except Exception:
-        return True
+        return True  # unparseable → include
 
 
 def _dismiss_overlays(page):
@@ -440,6 +440,7 @@ def get_links_from_embedded_jobboard(board_url: str, since_dt: datetime = None) 
         for job in jobs:
             if not isinstance(job, dict):
                 continue
+            # Date filter
             if since_dt and not _is_job_within_range(job.get("published", ""), since_dt):
                 continue
             job_url = job.get("url") or job.get("application_url") or job.get("apply_url")
@@ -463,242 +464,15 @@ def get_links_from_embedded_jobboard(board_url: str, since_dt: datetime = None) 
 
 
 # ============================================================================
-# BOARD PAGE STRUCTURED EXTRACTOR
-# ============================================================================
-
-def _extract_jobs_from_board_page(page, clean_url: str) -> list:
-    """
-    Extract structured job metadata from the board listing page DOM.
-
-    Handles both known Workable board layouts:
-      Layout A (Midnite/CloudLinux):  li[data-ui='job']
-      Layout B (Constructor-1):       li[data-ui='job-opening']
-
-    Returns list of dicts with: url, jobId, title, posted,
-    workplace, location, locations[], department, type
-    """
-    jobs = []
-
-    # Try all known job item selectors in priority order
-    items = page.query_selector_all("li[data-ui='job']")
-    if not items:
-        items = page.query_selector_all("li[data-ui='job-opening']")
-    if not items:
-        items = page.query_selector_all("li[data-ui='job-board-position']")
-
-    for item in items:
-        try:
-            job = {}
-
-            # ── URL (required) ─────────────────────────────────────────
-            link_el = item.query_selector("a[href*='/j/']")
-            if not link_el:
-                link_el = item.query_selector("a[aria-labelledby]") or item.query_selector("a")
-            if not link_el:
-                continue
-            href = link_el.get_attribute("href")
-            if not href or '/j/' not in href:
-                continue
-            job["url"] = urljoin(clean_url, href)
-
-            # ── Job ID: prefer data-id on <li>, else parse from href ───
-            job_id = item.get_attribute("data-id")
-            if not job_id:
-                parts = href.strip("/").split("/j/")
-                if len(parts) > 1:
-                    job_id = parts[1].strip("/")
-            if job_id:
-                job["jobId"] = job_id
-
-            # ── Title (required) ───────────────────────────────────────
-            # Layout A: [data-ui="job-title"]
-            # Layout B: h3[data-id="job-item"]
-            el = item.query_selector('[data-ui="job-title"]') or \
-                 item.query_selector('h3[data-id="job-item"]')
-            if not el:
-                continue
-            title = el.inner_text().strip()
-            if not title:
-                continue
-            job["title"] = title
-
-            # ── Posted date (optional — some boards omit it) ───────────
-            el = item.query_selector('[data-ui="job-posted"]')
-            if el:
-                posted_text = el.inner_text().strip()
-                if posted_text:
-                    job["posted"] = posted_text
-
-            # ── Workplace ──────────────────────────────────────────────
-            el = item.query_selector('[data-ui="job-workplace"]')
-            if el:
-                wp = el.inner_text().strip()
-                if wp:
-                    job["workplace"] = wp
-
-            # ── Locations — ALL tooltips (multi-location jobs) ─────────
-            # Each <div data-ui="job-location-tooltip"> = one city/country
-            tooltips = item.query_selector_all('[data-ui="job-location-tooltip"]')
-            if tooltips:
-                locs = []
-                for t in tooltips:
-                    txt = t.inner_text().strip()
-                    if txt and txt not in locs:
-                        locs.append(txt)
-                if locs:
-                    job["locations"] = locs    # full list
-                    job["location"]  = locs[0] # primary (first)
-            else:
-                # fallback: single location element
-                el = item.query_selector('[data-ui="job-location"]')
-                if el:
-                    loc = el.inner_text().strip()
-                    if loc:
-                        job["location"] = loc
-
-            # ── Department (optional) ──────────────────────────────────
-            el = item.query_selector('[data-ui="job-department"]')
-            if el:
-                dept = el.inner_text().strip()
-                if dept:
-                    job["department"] = dept
-
-            # ── Type (optional) ────────────────────────────────────────
-            el = item.query_selector('[data-ui="job-type"]')
-            if el:
-                jtype = el.inner_text().strip()
-                if jtype:
-                    job["type"] = jtype
-
-            job["method"] = "stealth_dom"
-            jobs.append(job)
-
-        except:
-            continue
-
-    return jobs
-
-
-# ============================================================================
-# API DATE FETCHER — only called when DOM is missing posted dates
-# ============================================================================
-
-def _fetch_api_dates(account: str) -> dict:
-    """
-    Call Workable board API and return {shortcode: {published, pub_date}}.
-    Only invoked when board page DOM is missing posted dates for some jobs.
-    """
-    api_map = {}
-    try:
-        api_url = f"https://apply.workable.com/api/v3/accounts/{account}/jobs"
-        headers = {
-            "Accept": "application/json",
-            "Content-Type": "application/json",
-            "User-Agent": random.choice(USER_AGENTS),
-        }
-        proxies  = _bd_requests_proxies() if USE_BRIGHT_DATA else {}
-        next_page = None
-        page_num  = 0
-
-        while page_num < 20:
-            page_num += 1
-            payload = {
-                "query": "", "location": [],
-                "department": [], "worktype": [], "remote": []
-            }
-            if next_page:
-                payload["nextPage"] = next_page
-
-            resp = requests.post(
-                api_url, json=payload, headers=headers,
-                timeout=20, proxies=proxies, verify=REQUESTS_VERIFY
-            )
-            if USE_BRIGHT_DATA and resp.status_code in {402, 403, 407}:
-                logger.warning("   API date fetch: proxy blocked, retrying direct...")
-                resp = requests.post(
-                    api_url, json=payload, headers=headers,
-                    timeout=20, proxies={}, verify=True
-                )
-
-            if resp.status_code != 200:
-                logger.warning(f"   API date fetch status {resp.status_code}")
-                break
-
-            data    = resp.json()
-            results = data.get("results", [])
-            if not results:
-                break
-
-            for job in results:
-                sc      = job.get("shortcode")
-                pub_str = job.get("published", "")
-                if sc and pub_str:
-                    normalized = pub_str
-                    if normalized.endswith("Z"):
-                        normalized = normalized[:-1] + "+00:00"
-                    try:
-                        pub_date = datetime.fromisoformat(normalized)
-                        if pub_date.tzinfo is None:
-                            pub_date = pub_date.replace(tzinfo=timezone.utc)
-                        api_map[sc] = {
-                            "published": pub_str[:10],
-                            "pub_date":  pub_date,
-                        }
-                    except:
-                        api_map[sc] = {"published": pub_str[:10]}
-
-            next_page = data.get("nextPage") or data.get("nextPageToken")
-            if not next_page:
-                break
-
-            time.sleep(random.uniform(1, 2))
-
-        logger.info(f"   API date map: {len(api_map)} jobs")
-
-    except Exception as e:
-        logger.warning(f"   API date fetch failed: {e}")
-
-    return api_map
-
-
-# ============================================================================
-# GET JOB LINKS — STEALTH DOM FIRST, API FALLBACK
+# GET JOB LINKS - STEALTH DOM FIRST, API FALLBACK
 # ============================================================================
 
 def get_links_from_dom_stealth(board_url: str, since_dt: datetime = None) -> list:
-    """
-    Primary scraping method for Workable board pages.
-
-    Step 1 — Board page DOM:
-        Use _extract_jobs_from_board_page() to get structured job metadata:
-        title, url, jobId, posted, workplace, location, locations[],
-        department, type — all from the listing page.
-
-    Step 2 — API date fallback (only when needed):
-        If some jobs are missing a 'posted' date in the DOM, call the
-        Workable API for that company only to get published dates.
-        Merge into DOM results.
-
-    Step 3 — Date filter:
-        - DOM has 'posted' text  → parse "N days ago" and filter
-        - DOM missing, API has date → use API date for filtering
-        - No date info at all   → include job (don't drop blindly)
-
-    Step 4 — Load More pagination:
-        Click "Show more" until exhausted or date cutoff reached.
-
-    Fallback strategies (if board-page selectors find nothing):
-        A. Scan all /j/ links on the page
-        B. Use captured in-browser API responses
-        C. In-browser fetch() call to Workable API
-    """
     clean_url = board_url.split('#')[0].rstrip('/')
-    account   = _account_from_board_url(clean_url)
 
     for attempt in range(MAX_RETRIES):
-        all_jobs      = []
+        all_links = []
         proxy_blocked = False
-
         try:
             logger.info(f"🥷 Stealth DOM attempt {attempt + 1}")
 
@@ -714,7 +488,8 @@ def get_links_from_dom_stealth(board_url: str, since_dt: datetime = None) -> lis
                     def _capture_api(resp):
                         nonlocal proxy_blocked
                         try:
-                            if "apply.workable.com/api/" not in resp.url:
+                            url = resp.url
+                            if "apply.workable.com/api/" not in url:
                                 return
                             if resp.status == 402:
                                 proxy_blocked = True
@@ -724,7 +499,7 @@ def get_links_from_dom_stealth(board_url: str, since_dt: datetime = None) -> lis
                             data = resp.json()
                             if isinstance(data, dict) and data.get("results"):
                                 api_payloads.append(data)
-                        except:
+                        except Exception:
                             return
 
                     page.on("response", _capture_api)
@@ -740,67 +515,84 @@ def get_links_from_dom_stealth(board_url: str, since_dt: datetime = None) -> lis
                     except:
                         pass
                     page.wait_for_timeout(random.randint(1000, 2000))
+
                     _dismiss_overlays(page)
 
                     try:
                         title = (page.title() or "").lower()
-                        body  = (page.inner_text("body") or "").lower()
+                        body = (page.inner_text("body") or "").lower()
                         if any(x in title for x in ["just a moment", "access denied", "attention required"]) or \
-                           any(x in body  for x in ["just a moment", "access denied", "captcha"]):
+                           any(x in body for x in ["just a moment", "access denied", "captcha"]):
                             logger.warning("   Possible block page detected")
                     except:
                         pass
 
-                    # ── STEP 1: Structured DOM extraction ──────────────
-                    all_jobs = _extract_jobs_from_board_page(page, clean_url)
-                    logger.info(f"   DOM: {len(all_jobs)} jobs found")
+                    job_selectors = [
+                        "li[data-ui='job']",
+                        "li[data-ui='job-opening']",
+                        "li[data-ui='job-board-position']",
+                        ".job-item",
+                        "[role='listitem']",
+                        "div[data-ui='job-card']"
+                    ]
 
-                    # ── Fallback A: scan raw /j/ links ─────────────────
-                    if not all_jobs:
+                    job_elements = []
+                    selected_selector = None
+                    for selector in job_selectors:
+                        try:
+                            elements = page.query_selector_all(selector)
+                            if elements:
+                                job_elements = elements
+                                selected_selector = selector
+                                logger.info(f"   Found {len(elements)} with: {selector}")
+                                break
+                        except:
+                            continue
+
+                    if not job_elements:
                         logger.info("   Scanning all /j/ links...")
-                        raw_links = []
                         try:
                             for link in page.query_selector_all("a[href]"):
                                 href = link.get_attribute("href")
                                 if href and '/j/' in href and len(href.split('/j/')[1].split('/')[0]) > 5:
                                     full_url = urljoin(clean_url, href)
-                                    if full_url not in raw_links:
-                                        raw_links.append(full_url)
+                                    if full_url not in all_links:
+                                        all_links.append(full_url)
+                            if all_links:
+                                logger.info(f"   ✓ Found {len(all_links)} links")
                         except Exception as e:
                             logger.debug(f"   Link scan error: {e}")
 
-                        if not raw_links:
-                            raw_links = _scroll_and_collect_links(page, clean_url)
+                    if not job_elements and not all_links:
+                        logger.info("   Scrolling to load jobs...")
+                        all_links = _scroll_and_collect_links(page, clean_url)
+                        if all_links:
+                            logger.info(f"   ✓ Found {len(all_links)} links after scroll")
 
-                        if raw_links:
-                            logger.info(f"   ✓ Found {len(raw_links)} raw /j/ links")
-                            all_jobs = [{"url": l, "method": "stealth_dom"} for l in raw_links]
-
-                    # ── Fallback B: captured API responses ─────────────
-                    if not all_jobs and api_payloads:
-                        logger.info("   Using captured in-browser API responses...")
-                        raw_links = []
+                    if not job_elements and not all_links and api_payloads:
+                        logger.info("   Using in-browser API responses...")
                         for payload in api_payloads:
-                            links = _links_from_workable_results(payload.get("results", []), clean_url)
+                            results = payload.get("results", [])
+                            links = _links_from_workable_results(results, clean_url)
                             for l in links:
-                                if l not in raw_links:
-                                    raw_links.append(l)
-                        if raw_links:
-                            all_jobs = [{"url": l, "method": "stealth_dom"} for l in raw_links]
-                            logger.info(f"   ✓ {len(all_jobs)} from API responses")
+                                if l not in all_links:
+                                    all_links.append(l)
+                        if all_links:
+                            logger.info(f"   ✓ Found {len(all_links)} links from API responses")
 
-                    # ── Fallback C: in-browser fetch() to API ──────────
-                    if not all_jobs and account:
-                        logger.info("   In-browser fetch() to Workable API...")
-                        try:
-                            api_url  = f"https://apply.workable.com/api/v3/accounts/{account}/jobs"
-                            payload  = {"query": "", "location": [], "department": [], "worktype": [], "remote": []}
-                            next_tok = None
-                            for page_idx in range(1, 6):
-                                if next_tok:
-                                    payload["nextPage"] = next_tok
-                                data = page.evaluate(
-                                    """
+                    if not job_elements and not all_links:
+                        account = _account_from_board_url(clean_url)
+                        if account:
+                            try:
+                                logger.info("   Using in-browser fetch to API...")
+                                api_url = f"https://apply.workable.com/api/v3/accounts/{account}/jobs"
+                                payload = {"query": "", "location": [], "department": [], "worktype": [], "remote": []}
+                                next_page = None
+                                for page_idx in range(1, 6):
+                                    if next_page:
+                                        payload["nextPage"] = next_page
+                                    data = page.evaluate(
+                                        """
 (async ({ apiUrl, payload }) => {
   try {
     const res = await fetch(apiUrl, {
@@ -819,158 +611,145 @@ def get_links_from_dom_stealth(board_url: str, since_dt: datetime = None) -> lis
     if (contentType.includes('application/json')) {
       try { json = JSON.parse(text); } catch (e) {}
     }
-    return { ok: res.ok, status: res.status, contentType, json };
+    return { ok: res.ok, status: res.status, contentType, json, bodySnippet: text.slice(0, 200) };
   } catch (e) {
     return { ok: false, status: 0, error: String(e) };
   }
 })
 """,
-                                    {"apiUrl": api_url, "payload": payload},
-                                )
-                                if isinstance(data, dict) and data.get("status") == 402:
-                                    proxy_blocked = True
-                                    break
-                                if isinstance(data, dict) and data.get("json") and data["json"].get("results"):
-                                    links = _links_from_workable_results(data["json"]["results"], clean_url)
-                                    for l in links:
-                                        if not any(j.get("url") == l for j in all_jobs):
-                                            all_jobs.append({"url": l, "method": "stealth_dom"})
-                                    next_tok = data["json"].get("nextPage") or data["json"].get("nextPageToken")
-                                    if not next_tok:
+                                        {"apiUrl": api_url, "payload": payload},
+                                    )
+                                    if isinstance(data, dict) and data.get("status") == 402:
+                                        proxy_blocked = True
                                         break
-                                else:
-                                    break
-                        except Exception as e:
-                            logger.debug(f"   In-browser fetch failed: {e}")
+                                    if isinstance(data, dict) and data.get("json") and data["json"].get("results"):
+                                        links = _links_from_workable_results(data["json"].get("results"), clean_url)
+                                        if links:
+                                            all_links.extend([l for l in links if l not in all_links])
+                                        next_page = data["json"].get("nextPage") or data["json"].get("nextPageToken")
+                                        if not next_page:
+                                            break
+                                    else:
+                                        break
+                            except Exception as e:
+                                logger.debug(f"   In-browser fetch failed: {e}")
 
-                    # Check genuinely empty board
-                    if not all_jobs:
-                        try:
-                            page_text = page.inner_text('body').lower()
-                            if any(x in page_text for x in [
-                                "no open positions", "no positions available",
-                                "currently no openings", "not hiring"
-                            ]):
-                                logger.info("   ℹ️  Board has no open positions")
-                                browser.close()
-                                return []
-                        except:
-                            pass
+                    if not job_elements and not all_links:
+                        page_text = page.inner_text('body').lower()
+                        if any(x in page_text for x in ["no open positions", "no positions available", "currently no openings", "not hiring"]):
+                            logger.info("   ℹ️  No open positions")
+                            browser.close()
+                            return []
 
-                    # ── STEP 4: Load More pagination ───────────────────
-                    # Only paginate if we got structured jobs (have jobId)
-                    has_structured = any(j.get("jobId") for j in all_jobs)
-                    if has_structured:
-                        load_more_selectors = [
-                            "button[data-ui='load-more-button']",
-                            "button:has-text('Show more')",
-                            "button:has-text('Load more')",
-                            "button:has-text('View more jobs')",
-                        ]
-                        consecutive_no_change = 0
+                    if job_elements:
+                        stop_pagination = False
+                        for item in job_elements:
+                            try:
+                                link_el = None
+                                for s in ["a[aria-labelledby]", "a[href*='/j/']", "a"]:
+                                    link_el = item.query_selector(s)
+                                    if link_el:
+                                        break
+                                if not link_el:
+                                    continue
+                                href = link_el.get_attribute("href")
+                                if not href or '/j/' not in href:
+                                    continue
 
-                        for _ in range(20):
-                            clicked = _click_load_more(page, load_more_selectors)
-                            if not clicked:
-                                logger.info("   No more 'Load more' button")
-                                break
-
-                            page.wait_for_timeout(random.randint(4000, 7000))
-                            new_batch = _extract_jobs_from_board_page(page, clean_url)
-
-                            # Merge new jobs by URL
-                            existing_urls  = {j["url"] for j in all_jobs}
-                            added          = 0
-                            stop_pagination = False
-
-                            for job in new_batch:
-                                if job["url"] not in existing_urls:
-                                    all_jobs.append(job)
-                                    existing_urls.add(job["url"])
-                                    added += 1
-
-                                    # Early stop: posted date beyond cutoff
-                                    if since_dt and job.get("posted"):
-                                        m = re.search(r"(\d+)\s+day", job["posted"])
-                                        if m:
-                                            days_ago = int(m.group(1))
-                                            job_dt   = datetime.now(timezone.utc) - timedelta(days=days_ago)
+                                # Date filter via DOM "days ago" badge
+                                if since_dt:
+                                    posted_el = item.query_selector("[data-ui='job-posted']")
+                                    if posted_el:
+                                        match = re.search(r"(\d+)\s+day", posted_el.inner_text().strip())
+                                        if match:
+                                            days_ago = int(match.group(1))
+                                            job_dt = datetime.now(timezone.utc) - timedelta(days=days_ago)
                                             if job_dt < since_dt:
+                                                # Jobs are listed newest-first; once we're past the cutoff
+                                                # we can stop loading more pages
                                                 stop_pagination = True
+                                                continue
 
-                            if stop_pagination:
-                                logger.info("   ⏹️  Reached date cutoff, stopping pagination")
-                                break
+                                full_url = urljoin(clean_url, href)
+                                if full_url not in all_links:
+                                    all_links.append(full_url)
+                            except:
+                                continue
 
-                            if added > 0:
-                                logger.info(f"   ✓ +{added} jobs (total: {len(all_jobs)})")
-                                consecutive_no_change = 0
-                            else:
-                                consecutive_no_change += 1
-                                if consecutive_no_change >= 3:
-                                    logger.info("   No new jobs after 3 clicks, stopping")
+                        logger.info(f"   Collected {len(all_links)} jobs (stop_pagination={stop_pagination})")
+
+                        if not stop_pagination:
+                            load_more_selectors = [
+                                "button[data-ui='load-more-button']",
+                                "button:has-text('Show more')",
+                                "button:has-text('Load more')",
+                                "button:has-text('View more jobs')"
+                            ]
+                            consecutive_no_change = 0
+                            for _ in range(20):
+                                clicked = _click_load_more(page, load_more_selectors)
+                                if not clicked:
                                     break
+
+                                page.wait_for_timeout(random.randint(4000, 7000))
+
+                                before = len(all_links)
+                                new_elements = page.query_selector_all(selected_selector)
+                                new_batch = []
+                                local_stop = False
+
+                                for item in new_elements:
+                                    try:
+                                        link_el = None
+                                        for s in ["a[aria-labelledby]", "a[href*='/j/']", "a"]:
+                                            link_el = item.query_selector(s)
+                                            if link_el:
+                                                break
+                                        if not link_el:
+                                            continue
+                                        href = link_el.get_attribute("href")
+                                        if not href or '/j/' not in href:
+                                            continue
+
+                                        if since_dt:
+                                            posted_el = item.query_selector("[data-ui='job-posted']")
+                                            if posted_el:
+                                                match = re.search(r"(\d+)\s+day", posted_el.inner_text().strip())
+                                                if match:
+                                                    days_ago = int(match.group(1))
+                                                    job_dt = datetime.now(timezone.utc) - timedelta(days=days_ago)
+                                                    if job_dt < since_dt:
+                                                        local_stop = True
+                                                        continue
+
+                                        full_url = urljoin(clean_url, href)
+                                        if full_url not in new_batch:
+                                            new_batch.append(full_url)
+                                    except:
+                                        continue
+
+                                all_links = list(set(all_links) | set(new_batch))
+
+                                if local_stop:
+                                    logger.info("   ⏹️  Reached date cutoff, stopping pagination")
+                                    break
+
+                                if len(all_links) > before:
+                                    consecutive_no_change = 0
+                                else:
+                                    consecutive_no_change += 1
+                                    if consecutive_no_change >= 3:
+                                        break
 
                     browser.close()
 
-                if not all_jobs:
-                    if use_proxy and proxy_blocked:
-                        logger.warning("   Proxy 402, retrying direct...")
-                        continue
-                    break
+                if all_links:
+                    logger.info(f"✅ Stealth DOM: {len(all_links)} links")
+                    return list(set(all_links))
 
-                # ── STEP 2: API date fallback ──────────────────────────
-                # Only fetch if some structured jobs are missing posted date
-                api_date_map    = {}
-                structured_jobs = [j for j in all_jobs if j.get("jobId")]
-                missing_posted  = any(not j.get("posted") for j in structured_jobs)
-
-                if missing_posted and account and since_dt:
-                    logger.info(f"   ⚠️  Some jobs missing posted date → fetching API dates for '{account}'...")
-                    api_date_map = _fetch_api_dates(account)
-
-                # ── STEP 3: Date filter ────────────────────────────────
-                filtered = []
-                for job in all_jobs:
-                    job_id      = job.get("jobId", "")
-                    posted_text = job.get("posted", "")
-
-                    if posted_text and since_dt:
-                        # DOM has posted text → parse and filter
-                        day_match = re.search(r"(\d+)\s+day", posted_text)
-                        if day_match:
-                            days_ago = int(day_match.group(1))
-                            job_dt   = datetime.now(timezone.utc) - timedelta(days=days_ago)
-                            if job_dt < since_dt:
-                                continue  # too old
-                        elif "month" in posted_text:
-                            months_match = re.search(r"(\d+)\s+month", posted_text)
-                            months = int(months_match.group(1)) if months_match else 1
-                            job_dt = datetime.now(timezone.utc) - timedelta(days=months * 30)
-                            if job_dt < since_dt:
-                                continue  # too old
-
-                    elif job_id and job_id in api_date_map and since_dt:
-                        # No DOM posted date → use API date
-                        api_info = api_date_map[job_id]
-                        job["published"] = api_info.get("published", "")
-                        pub_date = api_info.get("pub_date")
-                        if pub_date and pub_date < since_dt:
-                            continue  # too old per API
-
-                    # No date info at all → include (don't drop blindly)
-                    filtered.append(job)
-
-                # Deduplicate by URL
-                seen   = set()
-                unique = []
-                for job in filtered:
-                    if job["url"] not in seen:
-                        seen.add(job["url"])
-                        unique.append(job)
-
-                logger.info(f"✅ Stealth DOM: {len(unique)} jobs (after date filter)")
-                return unique
+                if use_proxy and proxy_blocked:
+                    logger.warning("   Proxy returned 402, retrying direct...")
+                    continue
 
             if attempt < MAX_RETRIES - 1:
                 time.sleep(RETRY_DELAY_BASE * (2 ** attempt))
@@ -984,15 +763,15 @@ def get_links_from_dom_stealth(board_url: str, since_dt: datetime = None) -> lis
 
 
 def get_links_from_api(board_url: str, since_dt: datetime = None) -> list:
-    """Get job links via Workable API — used when all DOM methods fail."""
+    """Get job links via Workable API with proper date filtering."""
     try:
         clean_url = board_url.split('#')[0].rstrip('/')
         subdomain = clean_url.strip("/").split("/")[-1]
-        api_url   = f"https://apply.workable.com/api/v3/accounts/{subdomain}/jobs"
+        api_url = f"https://apply.workable.com/api/v3/accounts/{subdomain}/jobs"
 
         logger.info(f"🔌 API fallback: fetching jobs...")
 
-        # Get Cloudflare cookies via stealth browser
+        # Cloudflare cookies
         cookies = {}
         try:
             with sync_playwright() as p:
@@ -1024,14 +803,15 @@ def get_links_from_api(board_url: str, since_dt: datetime = None) -> list:
         if cookies:
             headers["Cookie"] = "; ".join([f"{k}={v}" for k, v in cookies.items()])
 
+        all_jobs = []
         best_jobs = []
 
         for method in ["POST", "GET"]:
             try:
                 logger.info(f"   Trying {method}...")
                 next_page = None
-                page_num  = 0
-                all_jobs  = []
+                page_num = 0
+                all_jobs = []
 
                 while page_num < 100:
                     page_num += 1
@@ -1060,7 +840,7 @@ def get_links_from_api(board_url: str, since_dt: datetime = None) -> list:
                     if resp.status_code != 200:
                         break
 
-                    data    = resp.json()
+                    data = resp.json()
                     results = data.get("results", [])
                     if not results:
                         break
@@ -1071,12 +851,13 @@ def get_links_from_api(board_url: str, since_dt: datetime = None) -> list:
                     for job in results:
                         pub_str = job.get("published", "")
                         if since_dt and not _is_job_within_range(pub_str, since_dt):
+                            # API returns newest-first; once we hit an old job, stop
                             page_hit_cutoff = True
                             continue
                         all_jobs.append(job)
 
                     if page_hit_cutoff and page_num > 1:
-                        logger.info(f"   ⏹️  Reached date cutoff at page {page_num}")
+                        logger.info(f"   ⏹️  Reached date cutoff at page {page_num}, stopping")
                         break
 
                     next_page = data.get("nextPage") or data.get("nextPageToken")
@@ -1106,13 +887,13 @@ def get_links_from_api(board_url: str, since_dt: datetime = None) -> list:
                 locations = job.get("locations", [])
                 countries = {loc.get("country") for loc in locations if loc.get("country")}
                 job_map[title] = {
-                    "title":     title,
+                    "title": title,
                     "shortcode": job["shortcode"],
                     "countries": countries,
                     "published": job.get("published", ""),
-                    "remote":    job.get("remote", False),
-                    "type":      job.get("type"),
-                    "workplace": job.get("workplace"),
+                    "remote": job.get("remote", False),
+                    "type": job.get("type"),
+                    "workplace": job.get("workplace")
                 }
             else:
                 locs = job.get("locations", [])
@@ -1123,13 +904,13 @@ def get_links_from_api(board_url: str, since_dt: datetime = None) -> list:
             url = urljoin(board_url, f"j/{d['shortcode']}/")
             countries_list = sorted(d["countries"])
             final_jobs.append({
-                "url":           url,
-                "title":         title,
-                "countries":     countries_list,
+                "url": url,
+                "title": title,
+                "countries": countries_list,
                 "country_count": len(countries_list),
-                "remote":        d["remote"],
-                "published":     d["published"][:10] if d["published"] else "",
-                "method":        "api",
+                "remote": d["remote"],
+                "published": d["published"][:10] if d["published"] else "",
+                "method": "api"
             })
 
         logger.info(f"✅ API FINAL: {len(final_jobs)} unique jobs")
@@ -1141,41 +922,10 @@ def get_links_from_api(board_url: str, since_dt: datetime = None) -> list:
 
 
 # ============================================================================
-# GET JOB DETAILS — DOM PRIMARY, API FALLBACK
+# GET JOB DETAILS - unchanged from v7, kept verbatim
 # ============================================================================
 
 def extract_job_with_dom_stealth(job_url: str, account: str, shortcode: str):
-    """
-    Scrape full job details from the detail page.
-
-    The board page already provides: title, workplace, location, type,
-    department. This function adds the heavier content: description,
-    requirements, benefits, apply_url, company info, published date,
-    remote flag, eligible_countries.
-
-    DOM selectors (confirmed across Complexio, Deblock, CloudLinux):
-      title           h1[data-ui="job-title"]
-      workplace       [data-ui="job-workplace"]
-      department      [data-ui="job-department"]
-      type            [data-ui="job-type"]
-      location        [data-ui="job-location-tooltip"] (multiple, merged)
-      description     section[data-ui="job-description"]
-      requirements    section[data-ui="job-requirements"]
-      benefits        section[data-ui="job-benefits"]
-      apply_url       a[data-ui="apply-button"]
-      company         a[data-ui="company-logo"] img[alt]
-      company_logo    a[data-ui="company-logo"] img[src]
-      company_website a[data-ui="company-url"] (footer)
-
-    JSON-LD (richer structured data — preferred for dates/remote/countries):
-      published          datePosted
-      employment_type    employmentType
-      remote             jobLocationType == "TELECOMMUTE"
-      eligible_countries applicantLocationRequirements[].name
-      company_website    hiringOrganization.sameAs  (overrides footer)
-      company            hiringOrganization.name    (fallback)
-      company_logo       hiringOrganization.logo    (fallback)
-    """
     for attempt in range(MAX_RETRIES):
         try:
             with sync_playwright() as p:
@@ -1184,7 +934,6 @@ def extract_job_with_dom_stealth(job_url: str, account: str, shortcode: str):
                 page.goto(job_url, wait_until="domcontentloaded", timeout=30000)
                 page.wait_for_timeout(random.randint(3000, 5000))
 
-                # Retry on error pages
                 body_text = page.inner_text('body').lower()
                 if "error" in body_text and len(body_text) < 100:
                     page.reload(wait_until="domcontentloaded")
@@ -1199,207 +948,136 @@ def extract_job_with_dom_stealth(job_url: str, account: str, shortcode: str):
 
                 _dismiss_overlays(page)
 
-                job_data = {
-                    "jobId":   shortcode,
-                    "url":     job_url,
-                    "account": account,
-                }
+                job_data = {"jobId": shortcode, "url": job_url, "account": account}
 
-                # ── TITLE ──────────────────────────────────────────────
                 title = None
-                el = page.query_selector('h1[data-ui="job-title"]')
-                if el:
-                    title = el.inner_text().strip()
-                if not title:
-                    for sel in ['h1[itemprop="title"]', 'h1']:
-                        try:
-                            el = page.query_selector(sel)
-                            if el:
-                                t = el.inner_text().strip()
-                                if t and len(t) > 3 and "error" not in t.lower():
-                                    title = t
-                                    break
-                        except:
-                            continue
+                for sel in ['h1[data-ui="job-title"]', 'h1[itemprop="title"]', 'h1']:
+                    try:
+                        el = page.query_selector(sel)
+                        if el:
+                            text = el.inner_text().strip()
+                            if text and len(text) > 3 and "error" not in text.lower():
+                                title = text
+                                break
+                    except:
+                        continue
+
                 if not title:
                     title = page.title()
-                if not title or "error" in (title or "").lower():
+                if not title or "error" in title.lower():
                     browser.close()
                     if attempt < MAX_RETRIES - 1:
                         time.sleep(RETRY_DELAY_BASE * (2 ** attempt))
                         continue
                     return None
+
                 job_data["title"] = title
 
-                # ── COMPANY name + logo ────────────────────────────────
-                try:
-                    el = page.query_selector('a[data-ui="company-logo"] img')
-                    if el:
-                        alt = el.get_attribute("alt")
-                        src = el.get_attribute("src")
-                        if alt:
-                            job_data["company"] = alt
-                        if src:
-                            job_data["company_logo"] = src
-                except:
-                    pass
+                for sel in ['[data-ui="job-location"]', 'span[itemprop="addressLocality"]']:
+                    try:
+                        el = page.query_selector(sel)
+                        if el:
+                            job_data["location"] = el.inner_text().strip()
+                            break
+                    except:
+                        pass
 
-                # ── WORKPLACE ──────────────────────────────────────────
-                try:
-                    el = page.query_selector('[data-ui="job-workplace"]')
-                    if el:
-                        wp = el.inner_text().strip()
-                        if wp:
-                            job_data["workplace"] = wp
-                except:
-                    pass
-
-                # ── DEPARTMENT ─────────────────────────────────────────
                 try:
                     el = page.query_selector('[data-ui="job-department"]')
                     if el:
-                        dept = el.inner_text().strip()
-                        if dept:
-                            job_data["department"] = dept
+                        job_data["department"] = el.inner_text().strip()
                 except:
                     pass
 
-                # ── TYPE ───────────────────────────────────────────────
-                try:
-                    el = page.query_selector('[data-ui="job-type"]')
-                    if el:
-                        jtype = el.inner_text().strip()
-                        if jtype:
-                            job_data["type"] = jtype
-                except:
-                    pass
-
-                # ── LOCATION — all tooltips merged ─────────────────────
-                try:
-                    tooltips = page.query_selector_all('[data-ui="job-location-tooltip"]')
-                    if tooltips:
-                        locs = []
-                        for t in tooltips:
-                            txt = t.inner_text().strip()
-                            if txt and txt not in locs:
-                                locs.append(txt)
-                        if locs:
-                            job_data["locations"] = locs
-                            job_data["location"]  = locs[0]
-                    else:
-                        el = page.query_selector('[data-ui="job-location"]')
+                for sel in ['[data-ui="job-type"]', 'span[itemprop="employmentType"]']:
+                    try:
+                        el = page.query_selector(sel)
                         if el:
-                            loc = el.inner_text().strip()
-                            if loc:
-                                job_data["location"] = loc
-                except:
-                    pass
+                            job_data["type"] = el.inner_text().strip()
+                            break
+                    except:
+                        pass
 
-                # ── DESCRIPTION ────────────────────────────────────────
                 try:
-                    el = page.query_selector('section[data-ui="job-description"]') or \
-                         page.query_selector('[data-ui="job-description"]') or \
-                         page.query_selector('div[itemprop="description"]')
+                    el = page.query_selector('[data-ui="job-workplace"]')
                     if el:
-                        html = el.inner_html().strip()
-                        if html and len(html) > 100:
-                            job_data["description"] = html
+                        job_data["workplace"] = el.inner_text().strip()
                 except:
                     pass
 
-                # ── REQUIREMENTS ───────────────────────────────────────
-                try:
-                    el = page.query_selector('section[data-ui="job-requirements"]') or \
-                         page.query_selector('[data-ui="job-requirements"]')
-                    if el:
-                        html = el.inner_html().strip()
-                        if html and len(html) > 50:
-                            job_data["requirements"] = html
-                except:
-                    pass
+                desc_found = False
+                for sel in ['[data-ui="job-description"]', 'div[itemprop="description"]', 'section[data-ui="job-description"]', 'div.description']:
+                    try:
+                        el = page.query_selector(sel)
+                        if el:
+                            html = el.inner_html()
+                            if html and len(html) > 100:
+                                job_data["description"] = html
+                                desc_found = True
+                                break
+                    except:
+                        continue
 
-                # ── BENEFITS ───────────────────────────────────────────
-                try:
-                    el = page.query_selector('section[data-ui="job-benefits"]') or \
-                         page.query_selector('[data-ui="job-benefits"]')
-                    if el:
-                        html = el.inner_html().strip()
-                        if html and len(html) > 50:
-                            job_data["benefits"] = html
-                except:
-                    pass
+                if not desc_found:
+                    for sel in ['main', 'article', '[role="main"]', 'div[class*="content"]']:
+                        try:
+                            el = page.query_selector(sel)
+                            if el:
+                                html = el.inner_html()
+                                if html and len(html) > 500:
+                                    job_data["description"] = html
+                                    break
+                        except:
+                            pass
 
-                # ── APPLY URL ──────────────────────────────────────────
-                try:
-                    el = page.query_selector('a[data-ui="apply-button"]')
-                    if el:
-                        href = el.get_attribute("href")
-                        if href:
-                            job_data["apply_url"] = urljoin(job_url, href)
-                except:
-                    pass
+                for sel in ['[data-ui="job-requirements"]', 'section:has-text("Requirements")', 'div:has-text("Requirements")', 'section:has-text("Qualifications")']:
+                    try:
+                        el = page.query_selector(sel)
+                        if el:
+                            html = el.inner_html()
+                            if html and len(html) > 50:
+                                job_data["requirements"] = html
+                                break
+                    except:
+                        continue
 
-                # ── COMPANY WEBSITE (footer) ───────────────────────────
-                try:
-                    el = page.query_selector('a[data-ui="company-url"]')
-                    if el:
-                        href = el.get_attribute("href")
-                        if href:
-                            job_data["company_website"] = href
-                except:
-                    pass
+                for sel in ['[data-ui="job-benefits"]', 'section:has-text("Benefits")', 'div:has-text("Benefits")', 'section:has-text("What we offer")']:
+                    try:
+                        el = page.query_selector(sel)
+                        if el:
+                            html = el.inner_html()
+                            if html and len(html) > 50:
+                                job_data["benefits"] = html
+                                break
+                    except:
+                        continue
 
-                # ── JSON-LD structured data ────────────────────────────
-                # Primary source for: published, remote, eligible_countries,
-                # employment_type, and company_website (sameAs > footer link)
                 try:
                     script = page.query_selector('script[type="application/ld+json"]')
                     if script:
                         ld = json.loads(script.inner_text())
                         if isinstance(ld, dict):
-                            if "datePosted" in ld:
-                                job_data["published"] = ld["datePosted"]
-
-                            if "employmentType" in ld:
-                                job_data["employment_type"] = ld["employmentType"]
-
-                            if ld.get("jobLocationType") == "TELECOMMUTE":
-                                job_data["remote"] = True
-
-                            if "applicantLocationRequirements" in ld:
-                                job_data["eligible_countries"] = [
-                                    c["name"] for c in ld["applicantLocationRequirements"]
-                                    if isinstance(c, dict) and "name" in c
-                                ]
-
-                            org = ld.get("hiringOrganization", {})
-                            if isinstance(org, dict):
-                                if not job_data.get("company"):
+                            if "hiringOrganization" in ld:
+                                org = ld.get("hiringOrganization", {})
+                                if isinstance(org, dict):
                                     job_data["company"] = org.get("name")
-                                # sameAs is more reliable than footer link
-                                if org.get("sameAs"):
-                                    job_data["company_website"] = org["sameAs"]
-                                if not job_data.get("company_logo") and org.get("logo"):
-                                    job_data["company_logo"] = org["logo"]
+                            if "datePosted" in ld:
+                                job_data["published"] = ld.get("datePosted")
                 except:
                     pass
 
                 browser.close()
 
-                has_content = bool(
-                    job_data.get("description") or
-                    job_data.get("requirements") or
-                    job_data.get("location")
-                )
+                has_content = bool(job_data.get("description") or job_data.get("location"))
                 if has_content:
                     return job_data
                 elif attempt < MAX_RETRIES - 1:
                     time.sleep(RETRY_DELAY_BASE * (2 ** attempt))
                     continue
-                return job_data if job_data.get("title") else None
+                return job_data if title else None
 
         except Exception as e:
-            logger.error(f"Stealth DOM detail attempt {attempt + 1} failed: {e}")
+            logger.error(f"Stealth DOM attempt {attempt + 1} failed: {e}")
             if attempt < MAX_RETRIES - 1:
                 time.sleep(RETRY_DELAY_BASE * (2 ** attempt))
 
@@ -1407,7 +1085,6 @@ def extract_job_with_dom_stealth(job_url: str, account: str, shortcode: str):
 
 
 def extract_job_with_api(account: str, shortcode: str, job_url: str):
-    """Extract job details from Workable API — fallback when DOM fails."""
     endpoints = {
         "v3": f"https://apply.workable.com/api/v3/accounts/{account}/jobs/{shortcode}",
         "v2": f"https://apply.workable.com/api/v2/accounts/{account}/jobs/{shortcode}",
@@ -1415,7 +1092,7 @@ def extract_job_with_api(account: str, shortcode: str, job_url: str):
     headers = {
         "Accept": "application/json",
         "Content-Type": "application/json",
-        "User-Agent": random.choice(USER_AGENTS),
+        "User-Agent": random.choice(USER_AGENTS)
     }
     proxies = _bd_requests_proxies() if USE_BRIGHT_DATA else {}
 
@@ -1438,21 +1115,20 @@ def extract_job_with_api(account: str, shortcode: str, job_url: str):
                     d = resp.json()
                     logger.info(f"✅ API {name} ({method}) SUCCESS")
                     return {
-                        "jobId":        d.get("shortcode") or shortcode,
-                        "url":          job_url,
-                        "account":      account,
-                        "title":        d.get("title"),
-                        "department":   d.get("department"),
-                        "published":    d.get("published"),
-                        "location":     d.get("location"),
-                        "locations":    d.get("locations"),
-                        "type":         d.get("type"),
-                        "workplace":    d.get("workplace"),
-                        "remote":       d.get("remote"),
-                        "description":  d.get("description"),
+                        "jobId": d.get("shortcode") or shortcode,
+                        "url": job_url,
+                        "account": account,
+                        "title": d.get("title"),
+                        "department": d.get("department"),
+                        "published": d.get("published"),
+                        "location": d.get("location"),
+                        "locations": d.get("locations"),
+                        "type": d.get("type"),
+                        "workplace": d.get("workplace"),
+                        "remote": d.get("remote"),
+                        "description": d.get("description"),
                         "requirements": d.get("requirements"),
-                        "benefits":     d.get("benefits"),
-                        "method":       "api",
+                        "benefits": d.get("benefits"),
                     }
                 elif resp.status_code in [404, 410]:
                     break
@@ -1478,14 +1154,10 @@ def get_job_links(
     Get job links with flexible date filtering and checkpoint/resume support.
 
     Date filter priority:
-      1. hours > 0           →  last N hours
-      2. days  > 0           →  last N days
-      3. use_checkpoint=True →  resume from last run's newest job
-      4. no filter           →  fetch everything
-
-    Response jobs include metadata from the board page:
-      url, jobId, title, posted, workplace, location, locations[],
-      department, type, method
+      1. hours > 0  →  last N hours
+      2. days  > 0  →  last N days
+      3. use_checkpoint=True  →  resume from last run's newest job
+      4. no filter  →  fetch everything
     """
     logger.info(f"\n{'='*60}")
     logger.info(f"🎯 GET LINKS: {url}  days={days}  hours={hours}  use_checkpoint={use_checkpoint}")
@@ -1495,6 +1167,7 @@ def get_job_links(
         domain = urlparse(url).netloc
         rate_limiter.wait_if_needed(domain)
 
+        # Resolve effective since_dt
         since_dt = compute_since_dt(
             days=days,
             hours=hours,
@@ -1507,21 +1180,20 @@ def get_job_links(
 
         # ---- Lever ----
         if is_lever_url(url):
-            links = get_links_from_lever_api(
-                url,
-                days=int(days) if days > 0 else (int(hours / 24) + 1 if hours > 0 else 9999)
-            )
+            links = get_links_from_lever_api(url, days=int(days) if days > 0 else (int(hours / 24) + 1 if hours > 0 else 9999))
             if links:
+                # Lever API returns full job objects; filter by since_dt
                 if since_dt:
                     links = [j for j in links if _is_job_within_range(j.get("published", ""), since_dt)]
                 rate_limiter.record_success(domain)
                 _maybe_save_checkpoint(url, links, save_progress)
                 return {"success": True, "total": len(links), "jobs": links, "method": "lever_api", "since": since_str}
 
-        # ---- 1st: Stealth DOM (returns rich job dicts) ----
-        jobs = get_links_from_dom_stealth(url, since_dt=since_dt)
-        if jobs:
+        # ---- 1st: Stealth DOM ----
+        links = get_links_from_dom_stealth(url, since_dt=since_dt)
+        if links:
             rate_limiter.record_success(domain)
+            jobs = [{"url": l, "method": "stealth_dom"} for l in links]
             _maybe_save_checkpoint(url, jobs, save_progress)
             return {"success": True, "total": len(jobs), "jobs": jobs, "method": "stealth_dom", "since": since_str}
 
@@ -1536,11 +1208,11 @@ def get_job_links(
 
         # ---- 3rd: Workable API ----
         logger.info("Embedded jobboard failed, trying API...")
-        jobs = get_links_from_api(url, since_dt=since_dt)
-        if jobs:
+        links = get_links_from_api(url, since_dt=since_dt)
+        if links:
             rate_limiter.record_success(domain)
-            _maybe_save_checkpoint(url, jobs, save_progress)
-            return {"success": True, "total": len(jobs), "jobs": jobs, "method": "api", "since": since_str}
+            _maybe_save_checkpoint(url, links, save_progress)
+            return {"success": True, "total": len(links), "jobs": links, "method": "api", "since": since_str}
 
         return {"success": True, "total": 0, "jobs": [], "note": "No jobs found", "since": since_str}
 
@@ -1552,18 +1224,19 @@ def get_job_links(
 
 
 def _maybe_save_checkpoint(board_url: str, jobs: list, save_progress: bool):
-    """Save checkpoint using the newest published date from this run."""
+    """Save checkpoint using the newest published date from this run's jobs."""
     if not save_progress or not jobs:
         return
     try:
-        newest_pub   = ""
-        newest_url   = ""
+        # Find the most recently published job
+        newest_pub = ""
+        newest_url = ""
         newest_title = ""
         for job in jobs:
             pub = job.get("published", "") if isinstance(job, dict) else ""
             if pub and pub > newest_pub:
-                newest_pub   = pub
-                newest_url   = job.get("url", "") if isinstance(job, dict) else ""
+                newest_pub = pub
+                newest_url = job.get("url", "") if isinstance(job, dict) else ""
                 newest_title = job.get("title", "") if isinstance(job, dict) else ""
 
         save_checkpoint(
@@ -1579,16 +1252,6 @@ def _maybe_save_checkpoint(board_url: str, jobs: list, save_progress: bool):
 
 @app.get("/get-job-details")
 def get_job_details(url: str = Query(..., description="Workable or Lever job URL")):
-    """
-    Get full job details from the detail page.
-
-    Board page already provides: title, url, workplace, location,
-                                 locations[], type, department, posted
-    This endpoint adds:          description, requirements, benefits,
-                                 apply_url, company, company_logo,
-                                 company_website, published, employment_type,
-                                 remote, eligible_countries
-    """
     logger.info(f"\n🎯 GET DETAILS: {url}")
 
     try:
@@ -1605,18 +1268,17 @@ def get_job_details(url: str = Query(..., description="Workable or Lever job URL
 
         account, shortcode, _ = _parse_workable_url(url)
 
-        # 1st: Stealth DOM
         result = extract_job_with_dom_stealth(url, account, shortcode)
         if result and result.get("title"):
             result["method"] = "stealth_dom"
             rate_limiter.record_success(domain)
             return {"success": True, "job": result}
 
-        # 2nd: API fallback
         logger.info("Stealth DOM failed, trying API...")
         time.sleep(random.uniform(2, 4))
         result = extract_job_with_api(account, shortcode, url)
         if result and result.get("title"):
+            result["method"] = "api"
             rate_limiter.record_success(domain)
             return {"success": True, "job": result}
 
@@ -1651,7 +1313,7 @@ def checkpoint_clear(url: str = Query(..., description="Board URL to clear check
 
 
 # ============================================================================
-# RATE LIMIT ENDPOINTS
+# RATE LIMIT ENDPOINTS (unchanged)
 # ============================================================================
 
 @app.get("/rate-limit-status")
@@ -1672,51 +1334,51 @@ def reset_rate_limit(domain: str = Query(...)):
 @app.get("/health")
 def health():
     return {
-        "status":   "healthy",
-        "version":  "8.1-dom-enriched",
+        "status": "healthy",
+        "version": "8.0-checkpoint",
         "bright_data": {
             "enabled": USE_BRIGHT_DATA,
-            "host":    BD_HOST if USE_BRIGHT_DATA else None,
-            "port":    BD_PORT if USE_BRIGHT_DATA else None,
+            "host": BD_HOST if USE_BRIGHT_DATA else None,
+            "port": BD_PORT if USE_BRIGHT_DATA else None,
         },
-        "checkpoint_file":  os.path.abspath("scraper_checkpoints.json"),
-        "scraping_order":   ["stealth_dom", "embedded_jobboard", "api_fallback"],
+        "checkpoint_file": os.path.abspath("scraper_checkpoints.json"),
+        "scraping_order": ["stealth_dom", "embedded_jobboard", "api_fallback"],
         "rate_limiter": {
             "max_requests_per_5min": rate_limiter.max_requests_per_5min,
-            "min_delay_seconds":     rate_limiter.min_delay_seconds,
-            "max_delay_seconds":     rate_limiter.max_delay_seconds,
-        },
+            "min_delay_seconds": rate_limiter.min_delay_seconds,
+            "max_delay_seconds": rate_limiter.max_delay_seconds
+        }
     }
 
 
 @app.get("/")
 def root():
     return {
-        "name":    "Workable + Lever Scraper v8.1 - DOM Enriched",
-        "version": "8.1",
+        "name": "Workable + Lever Scraper v8 - Checkpoint + Date Filtering",
+        "version": "8.0",
         "whats_new": [
-            "📋 Board page now returns rich metadata per job: title, workplace, location, locations[], department, type",
-            "📅 API date fallback: only called per-company when DOM is missing posted dates",
-            "🌍 Multi-location support: all tooltip locations collected as list",
-            "🔍 Detail page: confirmed selectors for all Workable layouts + JSON-LD",
-            "🏢 JSON-LD: published, employment_type, remote, eligible_countries, company_website (sameAs)",
-            "🔖 Checkpoint/resume support unchanged from v8.0",
+            "📅 Flexible date filtering: ?days=5 or ?hours=24",
+            "🔖 Checkpoint/resume: remembers last run per board URL",
+            "⏹️  Smart pagination stop: halts once date cutoff is reached",
+            "🗃️  Checkpoint persisted to scraper_checkpoints.json",
         ],
-        "board_page_fields":  ["url", "jobId", "title", "posted", "workplace", "location", "locations", "department", "type"],
-        "detail_page_fields": ["description", "requirements", "benefits", "apply_url", "company", "company_logo", "company_website", "published", "employment_type", "remote", "eligible_countries"],
         "date_filter_priority": [
-            "1. hours > 0              →  last N hours",
-            "2. days  > 0              →  last N days",
-            "3. use_checkpoint=true    →  resume from last saved run",
-            "4. no filter              →  fetch everything",
+            "1. hours > 0   →  last N hours (e.g. ?hours=24)",
+            "2. days  > 0   →  last N days  (e.g. ?days=5)",
+            "3. use_checkpoint=true  →  resume from last saved run",
+            "4. no filter   →  fetch everything",
         ],
-        "endpoints": {
-            "/get-job-links":     "GET ?url=BOARD_URL&days=5&hours=0&use_checkpoint=true&save_progress=true",
-            "/get-job-details":   "GET ?url=JOB_URL",
-            "/checkpoint-status": "GET ?url=BOARD_URL",
+        "new_endpoints": {
+            "/checkpoint-status": "GET ?url=BOARD_URL  (omit url= for all boards)",
             "/checkpoint-clear":  "POST ?url=BOARD_URL",
-            "/rate-limit-status": "GET ?domain=DOMAIN",
-            "/reset-rate-limit":  "POST ?domain=DOMAIN",
-            "/health":            "GET",
         },
+        "endpoints": {
+            "/get-job-links":      "GET ?url=BOARD_URL&days=5&hours=0&use_checkpoint=true&save_progress=true",
+            "/get-job-details":    "GET ?url=JOB_URL",
+            "/checkpoint-status":  "GET ?url=BOARD_URL",
+            "/checkpoint-clear":   "POST ?url=BOARD_URL",
+            "/rate-limit-status":  "GET ?domain=DOMAIN",
+            "/reset-rate-limit":   "POST ?domain=DOMAIN",
+            "/health":             "GET",
+        }
     }
