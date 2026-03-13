@@ -6,6 +6,8 @@ from fastapi import FastAPI, Query, HTTPException
 from urllib.parse import urljoin, urlparse
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
 from playwright_stealth import stealth_sync
+import threading
+playwright_semaphore = threading.Semaphore(1) 
 import requests
 from datetime import datetime, timedelta, timezone
 import re
@@ -692,212 +694,212 @@ def get_links_from_dom_stealth(board_url: str, since_dt: datetime = None) -> lis
             for use_proxy in proxy_modes:
                 if not use_proxy and not proxy_blocked:
                     break
+                with playwright_semaphore:
+                    with sync_playwright() as p:
+                        browser, page = new_stealth_page(p, use_proxy=use_proxy)
+                        api_payloads = []
 
-                with sync_playwright() as p:
-                    browser, page = new_stealth_page(p, use_proxy=use_proxy)
-                    api_payloads = []
-
-                    def _capture_api(resp):
-                        nonlocal proxy_blocked
-                        try:
-                            if "apply.workable.com/api/" not in resp.url:
-                                return
-                            if resp.status == 402:
-                                proxy_blocked = True
-                                return
-                            if resp.status != 200:
-                                return
-                            data = resp.json()
-                            if isinstance(data, dict) and data.get("results"):
-                                api_payloads.append(data)
-                        except:
-                            return
-
-                    page.on("response", _capture_api)
-
-                    try:
-                        page.goto(clean_url, wait_until="domcontentloaded", timeout=40000)
-                    except PlaywrightTimeout:
-                        logger.warning("   Navigation timeout, continuing...")
-
-                    page.wait_for_timeout(random.randint(3000, 5000))
-                    try:
-                        page.wait_for_load_state("networkidle", timeout=10000)
-                    except:
-                        pass
-                    page.wait_for_timeout(random.randint(1000, 2000))
-                    _dismiss_overlays(page)
-
-                    try:
-                        title = (page.title() or "").lower()
-                        body  = (page.inner_text("body") or "").lower()
-                        if any(x in title for x in ["just a moment", "access denied", "attention required"]) or \
-                           any(x in body  for x in ["just a moment", "access denied", "captcha"]):
-                            logger.warning("   Possible block page detected")
-                    except:
-                        pass
-
-                    # ── STEP 1: Structured DOM extraction ──────────────
-                    all_jobs = _extract_jobs_from_board_page(page, clean_url)
-                    logger.info(f"   DOM: {len(all_jobs)} jobs found")
-
-                    # ── Fallback A: scan raw /j/ links ─────────────────
-                    if not all_jobs:
-                        logger.info("   Scanning all /j/ links...")
-                        raw_links = []
-                        try:
-                            for link in page.query_selector_all("a[href]"):
-                                href = link.get_attribute("href")
-                                if href and '/j/' in href and len(href.split('/j/')[1].split('/')[0]) > 5:
-                                    full_url = urljoin(clean_url, href)
-                                    if full_url not in raw_links:
-                                        raw_links.append(full_url)
-                        except Exception as e:
-                            logger.debug(f"   Link scan error: {e}")
-
-                        if not raw_links:
-                            raw_links = _scroll_and_collect_links(page, clean_url)
-
-                        if raw_links:
-                            logger.info(f"   ✓ Found {len(raw_links)} raw /j/ links")
-                            all_jobs = [{"url": l, "method": "stealth_dom"} for l in raw_links]
-
-                    # ── Fallback B: captured API responses ─────────────
-                    if not all_jobs and api_payloads:
-                        logger.info("   Using captured in-browser API responses...")
-                        raw_links = []
-                        for payload in api_payloads:
-                            links = _links_from_workable_results(payload.get("results", []), clean_url)
-                            for l in links:
-                                if l not in raw_links:
-                                    raw_links.append(l)
-                        if raw_links:
-                            all_jobs = [{"url": l, "method": "stealth_dom"} for l in raw_links]
-                            logger.info(f"   ✓ {len(all_jobs)} from API responses")
-
-                    # ── Fallback C: in-browser fetch() to API ──────────
-                    if not all_jobs and account:
-                        logger.info("   In-browser fetch() to Workable API...")
-                        try:
-                            api_url  = f"https://apply.workable.com/api/v3/accounts/{account}/jobs"
-                            payload  = {"query": "", "location": [], "department": [], "worktype": [], "remote": []}
-                            next_tok = None
-                            for page_idx in range(1, 6):
-                                if next_tok:
-                                    payload["nextPage"] = next_tok
-                                data = page.evaluate(
-                                    """
-(async ({ apiUrl, payload }) => {
-  try {
-    const res = await fetch(apiUrl, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Accept': 'application/json',
-        'X-Requested-With': 'XMLHttpRequest'
-      },
-      credentials: 'include',
-      body: JSON.stringify(payload)
-    });
-    const contentType = res.headers.get('content-type') || '';
-    const text = await res.text();
-    let json = null;
-    if (contentType.includes('application/json')) {
-      try { json = JSON.parse(text); } catch (e) {}
-    }
-    return { ok: res.ok, status: res.status, contentType, json };
-  } catch (e) {
-    return { ok: false, status: 0, error: String(e) };
-  }
-})
-""",
-                                    {"apiUrl": api_url, "payload": payload},
-                                )
-                                if isinstance(data, dict) and data.get("status") == 402:
+                        def _capture_api(resp):
+                            nonlocal proxy_blocked
+                            try:
+                                if "apply.workable.com/api/" not in resp.url:
+                                    return
+                                if resp.status == 402:
                                     proxy_blocked = True
-                                    break
-                                if isinstance(data, dict) and data.get("json") and data["json"].get("results"):
-                                    links = _links_from_workable_results(data["json"]["results"], clean_url)
-                                    for l in links:
-                                        if not any(j.get("url") == l for j in all_jobs):
-                                            all_jobs.append({"url": l, "method": "stealth_dom"})
-                                    next_tok = data["json"].get("nextPage") or data["json"].get("nextPageToken")
-                                    if not next_tok:
-                                        break
-                                else:
-                                    break
-                        except Exception as e:
-                            logger.debug(f"   In-browser fetch failed: {e}")
+                                    return
+                                if resp.status != 200:
+                                    return
+                                data = resp.json()
+                                if isinstance(data, dict) and data.get("results"):
+                                    api_payloads.append(data)
+                            except:
+                                return
 
-                    # Check genuinely empty board
-                    if not all_jobs:
+                        page.on("response", _capture_api)
+
                         try:
-                            page_text = page.inner_text('body').lower()
-                            if any(x in page_text for x in [
-                                "no open positions", "no positions available",
-                                "currently no openings", "not hiring"
-                            ]):
-                                logger.info("   ℹ️  Board has no open positions")
-                                browser.close()
-                                return []
+                            page.goto(clean_url, wait_until="domcontentloaded", timeout=40000)
+                        except PlaywrightTimeout:
+                            logger.warning("   Navigation timeout, continuing...")
+
+                        page.wait_for_timeout(random.randint(3000, 5000))
+                        try:
+                            page.wait_for_load_state("networkidle", timeout=10000)
+                        except:
+                            pass
+                        page.wait_for_timeout(random.randint(1000, 2000))
+                        _dismiss_overlays(page)
+
+                        try:
+                            title = (page.title() or "").lower()
+                            body  = (page.inner_text("body") or "").lower()
+                            if any(x in title for x in ["just a moment", "access denied", "attention required"]) or \
+                            any(x in body  for x in ["just a moment", "access denied", "captcha"]):
+                                logger.warning("   Possible block page detected")
                         except:
                             pass
 
-                    # ── STEP 4: Load More pagination ───────────────────
-                    # Only paginate if we got structured jobs (have jobId)
-                    has_structured = any(j.get("jobId") for j in all_jobs)
-                    if has_structured:
-                        load_more_selectors = [
-                            "button[data-ui='load-more-button']",
-                            "button:has-text('Show more')",
-                            "button:has-text('Load more')",
-                            "button:has-text('View more jobs')",
-                        ]
-                        consecutive_no_change = 0
+                        # ── STEP 1: Structured DOM extraction ──────────────
+                        all_jobs = _extract_jobs_from_board_page(page, clean_url)
+                        logger.info(f"   DOM: {len(all_jobs)} jobs found")
 
-                        for _ in range(20):
-                            clicked = _click_load_more(page, load_more_selectors)
-                            if not clicked:
-                                logger.info("   No more 'Load more' button")
-                                break
+                        # ── Fallback A: scan raw /j/ links ─────────────────
+                        if not all_jobs:
+                            logger.info("   Scanning all /j/ links...")
+                            raw_links = []
+                            try:
+                                for link in page.query_selector_all("a[href]"):
+                                    href = link.get_attribute("href")
+                                    if href and '/j/' in href and len(href.split('/j/')[1].split('/')[0]) > 5:
+                                        full_url = urljoin(clean_url, href)
+                                        if full_url not in raw_links:
+                                            raw_links.append(full_url)
+                            except Exception as e:
+                                logger.debug(f"   Link scan error: {e}")
 
-                            page.wait_for_timeout(random.randint(4000, 7000))
-                            new_batch = _extract_jobs_from_board_page(page, clean_url)
+                            if not raw_links:
+                                raw_links = _scroll_and_collect_links(page, clean_url)
 
-                            # Merge new jobs by URL
-                            existing_urls  = {j["url"] for j in all_jobs}
-                            added          = 0
-                            stop_pagination = False
+                            if raw_links:
+                                logger.info(f"   ✓ Found {len(raw_links)} raw /j/ links")
+                                all_jobs = [{"url": l, "method": "stealth_dom"} for l in raw_links]
 
-                            for job in new_batch:
-                                if job["url"] not in existing_urls:
-                                    all_jobs.append(job)
-                                    existing_urls.add(job["url"])
-                                    added += 1
+                        # ── Fallback B: captured API responses ─────────────
+                        if not all_jobs and api_payloads:
+                            logger.info("   Using captured in-browser API responses...")
+                            raw_links = []
+                            for payload in api_payloads:
+                                links = _links_from_workable_results(payload.get("results", []), clean_url)
+                                for l in links:
+                                    if l not in raw_links:
+                                        raw_links.append(l)
+                            if raw_links:
+                                all_jobs = [{"url": l, "method": "stealth_dom"} for l in raw_links]
+                                logger.info(f"   ✓ {len(all_jobs)} from API responses")
 
-                                    # Early stop: posted date beyond cutoff
-                                    if since_dt and job.get("posted"):
-                                        m = re.search(r"(\d+)\s+day", job["posted"])
-                                        if m:
-                                            days_ago = int(m.group(1))
-                                            job_dt   = datetime.now(timezone.utc) - timedelta(days=days_ago)
-                                            if job_dt < since_dt:
-                                                stop_pagination = True
+                        # ── Fallback C: in-browser fetch() to API ──────────
+                        if not all_jobs and account:
+                            logger.info("   In-browser fetch() to Workable API...")
+                            try:
+                                api_url  = f"https://apply.workable.com/api/v3/accounts/{account}/jobs"
+                                payload  = {"query": "", "location": [], "department": [], "worktype": [], "remote": []}
+                                next_tok = None
+                                for page_idx in range(1, 6):
+                                    if next_tok:
+                                        payload["nextPage"] = next_tok
+                                    data = page.evaluate(
+                                        """
+    (async ({ apiUrl, payload }) => {
+    try {
+        const res = await fetch(apiUrl, {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json',
+            'Accept': 'application/json',
+            'X-Requested-With': 'XMLHttpRequest'
+        },
+        credentials: 'include',
+        body: JSON.stringify(payload)
+        });
+        const contentType = res.headers.get('content-type') || '';
+        const text = await res.text();
+        let json = null;
+        if (contentType.includes('application/json')) {
+        try { json = JSON.parse(text); } catch (e) {}
+        }
+        return { ok: res.ok, status: res.status, contentType, json };
+    } catch (e) {
+        return { ok: false, status: 0, error: String(e) };
+    }
+    })
+    """,
+                                        {"apiUrl": api_url, "payload": payload},
+                                    )
+                                    if isinstance(data, dict) and data.get("status") == 402:
+                                        proxy_blocked = True
+                                        break
+                                    if isinstance(data, dict) and data.get("json") and data["json"].get("results"):
+                                        links = _links_from_workable_results(data["json"]["results"], clean_url)
+                                        for l in links:
+                                            if not any(j.get("url") == l for j in all_jobs):
+                                                all_jobs.append({"url": l, "method": "stealth_dom"})
+                                        next_tok = data["json"].get("nextPage") or data["json"].get("nextPageToken")
+                                        if not next_tok:
+                                            break
+                                    else:
+                                        break
+                            except Exception as e:
+                                logger.debug(f"   In-browser fetch failed: {e}")
 
-                            if stop_pagination:
-                                logger.info("   ⏹️  Reached date cutoff, stopping pagination")
-                                break
+                        # Check genuinely empty board
+                        if not all_jobs:
+                            try:
+                                page_text = page.inner_text('body').lower()
+                                if any(x in page_text for x in [
+                                    "no open positions", "no positions available",
+                                    "currently no openings", "not hiring"
+                                ]):
+                                    logger.info("   ℹ️  Board has no open positions")
+                                    browser.close()
+                                    return []
+                            except:
+                                pass
 
-                            if added > 0:
-                                logger.info(f"   ✓ +{added} jobs (total: {len(all_jobs)})")
-                                consecutive_no_change = 0
-                            else:
-                                consecutive_no_change += 1
-                                if consecutive_no_change >= 3:
-                                    logger.info("   No new jobs after 3 clicks, stopping")
+                        # ── STEP 4: Load More pagination ───────────────────
+                        # Only paginate if we got structured jobs (have jobId)
+                        has_structured = any(j.get("jobId") for j in all_jobs)
+                        if has_structured:
+                            load_more_selectors = [
+                                "button[data-ui='load-more-button']",
+                                "button:has-text('Show more')",
+                                "button:has-text('Load more')",
+                                "button:has-text('View more jobs')",
+                            ]
+                            consecutive_no_change = 0
+
+                            for _ in range(20):
+                                clicked = _click_load_more(page, load_more_selectors)
+                                if not clicked:
+                                    logger.info("   No more 'Load more' button")
                                     break
 
-                    browser.close()
+                                page.wait_for_timeout(random.randint(4000, 7000))
+                                new_batch = _extract_jobs_from_board_page(page, clean_url)
+
+                                # Merge new jobs by URL
+                                existing_urls  = {j["url"] for j in all_jobs}
+                                added          = 0
+                                stop_pagination = False
+
+                                for job in new_batch:
+                                    if job["url"] not in existing_urls:
+                                        all_jobs.append(job)
+                                        existing_urls.add(job["url"])
+                                        added += 1
+
+                                        # Early stop: posted date beyond cutoff
+                                        if since_dt and job.get("posted"):
+                                            m = re.search(r"(\d+)\s+day", job["posted"])
+                                            if m:
+                                                days_ago = int(m.group(1))
+                                                job_dt   = datetime.now(timezone.utc) - timedelta(days=days_ago)
+                                                if job_dt < since_dt:
+                                                    stop_pagination = True
+
+                                if stop_pagination:
+                                    logger.info("   ⏹️  Reached date cutoff, stopping pagination")
+                                    break
+
+                                if added > 0:
+                                    logger.info(f"   ✓ +{added} jobs (total: {len(all_jobs)})")
+                                    consecutive_no_change = 0
+                                else:
+                                    consecutive_no_change += 1
+                                    if consecutive_no_change >= 3:
+                                        logger.info("   No new jobs after 3 clicks, stopping")
+                                        break
+
+                        browser.close()
 
                 if not all_jobs:
                     if use_proxy and proxy_blocked:
@@ -981,22 +983,23 @@ def get_links_from_api(board_url: str, since_dt: datetime = None) -> list:
         # Get Cloudflare cookies via stealth browser
         cookies = {}
         try:
-            with sync_playwright() as p:
-                browser, page = new_stealth_page(p)
-                page.goto(clean_url, wait_until="domcontentloaded", timeout=60000)
-                try:
-                    page.wait_for_load_state("load", timeout=60000)
-                except:
-                    pass
-                page.wait_for_timeout(random.randint(3000, 5000))
-                try:
-                    page.click("text=Accept", timeout=3000)
-                except:
-                    pass
-                for c in page.context.cookies():
-                    if c["name"] in ["cf_clearance", "__cf_bm", "wmc"]:
-                        cookies[c["name"]] = c["value"]
-                browser.close()
+            with playwright_semaphore:
+                with sync_playwright() as p:
+                    browser, page = new_stealth_page(p)
+                    page.goto(clean_url, wait_until="domcontentloaded", timeout=60000)
+                    try:
+                        page.wait_for_load_state("load", timeout=60000)
+                    except:
+                        pass
+                    page.wait_for_timeout(random.randint(3000, 5000))
+                    try:
+                        page.click("text=Accept", timeout=3000)
+                    except:
+                        pass
+                    for c in page.context.cookies():
+                        if c["name"] in ["cf_clearance", "__cf_bm", "wmc"]:
+                            cookies[c["name"]] = c["value"]
+                    browser.close()
         except Exception as e:
             logger.warning(f"Cookie extraction failed: {e}")
 
@@ -1164,225 +1167,226 @@ def extract_job_with_dom_stealth(job_url: str, account: str, shortcode: str):
     """
     for attempt in range(MAX_RETRIES):
         try:
-            with sync_playwright() as p:
-                browser, page = new_stealth_page(p)
+            with playwright_semaphore:
+                with sync_playwright() as p:
+                    browser, page = new_stealth_page(p)
 
-                page.goto(job_url, wait_until="domcontentloaded", timeout=30000)
-                page.wait_for_timeout(random.randint(3000, 5000))
-
-                # Retry on error pages
-                body_text = page.inner_text('body').lower()
-                if "error" in body_text and len(body_text) < 100:
-                    page.reload(wait_until="domcontentloaded")
+                    page.goto(job_url, wait_until="domcontentloaded", timeout=30000)
                     page.wait_for_timeout(random.randint(3000, 5000))
+
+                    # Retry on error pages
                     body_text = page.inner_text('body').lower()
                     if "error" in body_text and len(body_text) < 100:
+                        page.reload(wait_until="domcontentloaded")
+                        page.wait_for_timeout(random.randint(3000, 5000))
+                        body_text = page.inner_text('body').lower()
+                        if "error" in body_text and len(body_text) < 100:
+                            browser.close()
+                            if attempt < MAX_RETRIES - 1:
+                                time.sleep(RETRY_DELAY_BASE * (2 ** attempt))
+                                continue
+                            return None
+
+                    _dismiss_overlays(page)
+
+                    job_data = {
+                        "jobId":   shortcode,
+                        "url":     job_url,
+                        "account": account,
+                    }
+
+                    # ── TITLE ──────────────────────────────────────────────
+                    title = None
+                    el = page.query_selector('h1[data-ui="job-title"]')
+                    if el:
+                        title = el.inner_text().strip()
+                    if not title:
+                        for sel in ['h1[itemprop="title"]', 'h1']:
+                            try:
+                                el = page.query_selector(sel)
+                                if el:
+                                    t = el.inner_text().strip()
+                                    if t and len(t) > 3 and "error" not in t.lower():
+                                        title = t
+                                        break
+                            except:
+                                continue
+                    if not title:
+                        title = page.title()
+                    if not title or "error" in (title or "").lower():
                         browser.close()
                         if attempt < MAX_RETRIES - 1:
                             time.sleep(RETRY_DELAY_BASE * (2 ** attempt))
                             continue
                         return None
+                    job_data["title"] = title
 
-                _dismiss_overlays(page)
+                    # ── COMPANY name + logo ────────────────────────────────
+                    try:
+                        el = page.query_selector('a[data-ui="company-logo"] img')
+                        if el:
+                            alt = el.get_attribute("alt")
+                            src = el.get_attribute("src")
+                            if alt:
+                                job_data["company"] = alt
+                            if src:
+                                job_data["company_logo"] = src
+                    except:
+                        pass
 
-                job_data = {
-                    "jobId":   shortcode,
-                    "url":     job_url,
-                    "account": account,
-                }
+                    # ── WORKPLACE ──────────────────────────────────────────
+                    try:
+                        el = page.query_selector('[data-ui="job-workplace"]')
+                        if el:
+                            wp = el.inner_text().strip()
+                            if wp:
+                                job_data["workplace"] = wp
+                    except:
+                        pass
 
-                # ── TITLE ──────────────────────────────────────────────
-                title = None
-                el = page.query_selector('h1[data-ui="job-title"]')
-                if el:
-                    title = el.inner_text().strip()
-                if not title:
-                    for sel in ['h1[itemprop="title"]', 'h1']:
-                        try:
-                            el = page.query_selector(sel)
+                    # ── DEPARTMENT ─────────────────────────────────────────
+                    try:
+                        el = page.query_selector('[data-ui="job-department"]')
+                        if el:
+                            dept = el.inner_text().strip()
+                            if dept:
+                                job_data["department"] = dept
+                    except:
+                        pass
+
+                    # ── TYPE ───────────────────────────────────────────────
+                    try:
+                        el = page.query_selector('[data-ui="job-type"]')
+                        if el:
+                            jtype = el.inner_text().strip()
+                            if jtype:
+                                job_data["type"] = jtype
+                    except:
+                        pass
+
+                    # ── LOCATION — all tooltips merged ─────────────────────
+                    try:
+                        tooltips = page.query_selector_all('[data-ui="job-location-tooltip"]')
+                        if tooltips:
+                            locs = []
+                            for t in tooltips:
+                                txt = t.inner_text().strip()
+                                if txt and txt not in locs:
+                                    locs.append(txt)
+                            if locs:
+                                job_data["locations"] = locs
+                                job_data["location"]  = locs[0]
+                        else:
+                            el = page.query_selector('[data-ui="job-location"]')
                             if el:
-                                t = el.inner_text().strip()
-                                if t and len(t) > 3 and "error" not in t.lower():
-                                    title = t
-                                    break
-                        except:
-                            continue
-                if not title:
-                    title = page.title()
-                if not title or "error" in (title or "").lower():
+                                loc = el.inner_text().strip()
+                                if loc:
+                                    job_data["location"] = loc
+                    except:
+                        pass
+
+                    # ── DESCRIPTION ────────────────────────────────────────
+                    try:
+                        el = page.query_selector('section[data-ui="job-description"]') or \
+                            page.query_selector('[data-ui="job-description"]') or \
+                            page.query_selector('div[itemprop="description"]')
+                        if el:
+                            html = el.inner_html().strip()
+                            if html and len(html) > 100:
+                                job_data["description"] = html
+                    except:
+                        pass
+
+                    # ── REQUIREMENTS ───────────────────────────────────────
+                    try:
+                        el = page.query_selector('section[data-ui="job-requirements"]') or \
+                            page.query_selector('[data-ui="job-requirements"]')
+                        if el:
+                            html = el.inner_html().strip()
+                            if html and len(html) > 50:
+                                job_data["requirements"] = html
+                    except:
+                        pass
+
+                    # ── BENEFITS ───────────────────────────────────────────
+                    try:
+                        el = page.query_selector('section[data-ui="job-benefits"]') or \
+                            page.query_selector('[data-ui="job-benefits"]')
+                        if el:
+                            html = el.inner_html().strip()
+                            if html and len(html) > 50:
+                                job_data["benefits"] = html
+                    except:
+                        pass
+
+                    # ── APPLY URL ──────────────────────────────────────────
+                    try:
+                        el = page.query_selector('a[data-ui="apply-button"]')
+                        if el:
+                            href = el.get_attribute("href")
+                            if href:
+                                job_data["apply_url"] = urljoin(job_url, href)
+                    except:
+                        pass
+
+                    # ── COMPANY WEBSITE (footer) ───────────────────────────
+                    try:
+                        el = page.query_selector('a[data-ui="company-url"]')
+                        if el:
+                            href = el.get_attribute("href")
+                            if href:
+                                job_data["company_website"] = href
+                    except:
+                        pass
+
+                    # ── JSON-LD structured data ────────────────────────────
+                    # Primary source for: published, remote, eligible_countries,
+                    # employment_type, and company_website (sameAs > footer link)
+                    try:
+                        script = page.query_selector('script[type="application/ld+json"]')
+                        if script:
+                            ld = json.loads(script.inner_text())
+                            if isinstance(ld, dict):
+                                if "datePosted" in ld:
+                                    job_data["published"] = ld["datePosted"]
+
+                                if "employmentType" in ld:
+                                    job_data["employment_type"] = ld["employmentType"]
+
+                                if ld.get("jobLocationType") == "TELECOMMUTE":
+                                    job_data["remote"] = True
+
+                                if "applicantLocationRequirements" in ld:
+                                    job_data["eligible_countries"] = [
+                                        c["name"] for c in ld["applicantLocationRequirements"]
+                                        if isinstance(c, dict) and "name" in c
+                                    ]
+
+                                org = ld.get("hiringOrganization", {})
+                                if isinstance(org, dict):
+                                    if not job_data.get("company"):
+                                        job_data["company"] = org.get("name")
+                                    # sameAs is more reliable than footer link
+                                    if org.get("sameAs"):
+                                        job_data["company_website"] = org["sameAs"]
+                                    if not job_data.get("company_logo") and org.get("logo"):
+                                        job_data["company_logo"] = org["logo"]
+                    except:
+                        pass
+
                     browser.close()
-                    if attempt < MAX_RETRIES - 1:
+
+                    has_content = bool(
+                        job_data.get("description") or
+                        job_data.get("requirements") or
+                        job_data.get("location")
+                    )
+                    if has_content:
+                        return job_data
+                    elif attempt < MAX_RETRIES - 1:
                         time.sleep(RETRY_DELAY_BASE * (2 ** attempt))
                         continue
-                    return None
-                job_data["title"] = title
-
-                # ── COMPANY name + logo ────────────────────────────────
-                try:
-                    el = page.query_selector('a[data-ui="company-logo"] img')
-                    if el:
-                        alt = el.get_attribute("alt")
-                        src = el.get_attribute("src")
-                        if alt:
-                            job_data["company"] = alt
-                        if src:
-                            job_data["company_logo"] = src
-                except:
-                    pass
-
-                # ── WORKPLACE ──────────────────────────────────────────
-                try:
-                    el = page.query_selector('[data-ui="job-workplace"]')
-                    if el:
-                        wp = el.inner_text().strip()
-                        if wp:
-                            job_data["workplace"] = wp
-                except:
-                    pass
-
-                # ── DEPARTMENT ─────────────────────────────────────────
-                try:
-                    el = page.query_selector('[data-ui="job-department"]')
-                    if el:
-                        dept = el.inner_text().strip()
-                        if dept:
-                            job_data["department"] = dept
-                except:
-                    pass
-
-                # ── TYPE ───────────────────────────────────────────────
-                try:
-                    el = page.query_selector('[data-ui="job-type"]')
-                    if el:
-                        jtype = el.inner_text().strip()
-                        if jtype:
-                            job_data["type"] = jtype
-                except:
-                    pass
-
-                # ── LOCATION — all tooltips merged ─────────────────────
-                try:
-                    tooltips = page.query_selector_all('[data-ui="job-location-tooltip"]')
-                    if tooltips:
-                        locs = []
-                        for t in tooltips:
-                            txt = t.inner_text().strip()
-                            if txt and txt not in locs:
-                                locs.append(txt)
-                        if locs:
-                            job_data["locations"] = locs
-                            job_data["location"]  = locs[0]
-                    else:
-                        el = page.query_selector('[data-ui="job-location"]')
-                        if el:
-                            loc = el.inner_text().strip()
-                            if loc:
-                                job_data["location"] = loc
-                except:
-                    pass
-
-                # ── DESCRIPTION ────────────────────────────────────────
-                try:
-                    el = page.query_selector('section[data-ui="job-description"]') or \
-                         page.query_selector('[data-ui="job-description"]') or \
-                         page.query_selector('div[itemprop="description"]')
-                    if el:
-                        html = el.inner_html().strip()
-                        if html and len(html) > 100:
-                            job_data["description"] = html
-                except:
-                    pass
-
-                # ── REQUIREMENTS ───────────────────────────────────────
-                try:
-                    el = page.query_selector('section[data-ui="job-requirements"]') or \
-                         page.query_selector('[data-ui="job-requirements"]')
-                    if el:
-                        html = el.inner_html().strip()
-                        if html and len(html) > 50:
-                            job_data["requirements"] = html
-                except:
-                    pass
-
-                # ── BENEFITS ───────────────────────────────────────────
-                try:
-                    el = page.query_selector('section[data-ui="job-benefits"]') or \
-                         page.query_selector('[data-ui="job-benefits"]')
-                    if el:
-                        html = el.inner_html().strip()
-                        if html and len(html) > 50:
-                            job_data["benefits"] = html
-                except:
-                    pass
-
-                # ── APPLY URL ──────────────────────────────────────────
-                try:
-                    el = page.query_selector('a[data-ui="apply-button"]')
-                    if el:
-                        href = el.get_attribute("href")
-                        if href:
-                            job_data["apply_url"] = urljoin(job_url, href)
-                except:
-                    pass
-
-                # ── COMPANY WEBSITE (footer) ───────────────────────────
-                try:
-                    el = page.query_selector('a[data-ui="company-url"]')
-                    if el:
-                        href = el.get_attribute("href")
-                        if href:
-                            job_data["company_website"] = href
-                except:
-                    pass
-
-                # ── JSON-LD structured data ────────────────────────────
-                # Primary source for: published, remote, eligible_countries,
-                # employment_type, and company_website (sameAs > footer link)
-                try:
-                    script = page.query_selector('script[type="application/ld+json"]')
-                    if script:
-                        ld = json.loads(script.inner_text())
-                        if isinstance(ld, dict):
-                            if "datePosted" in ld:
-                                job_data["published"] = ld["datePosted"]
-
-                            if "employmentType" in ld:
-                                job_data["employment_type"] = ld["employmentType"]
-
-                            if ld.get("jobLocationType") == "TELECOMMUTE":
-                                job_data["remote"] = True
-
-                            if "applicantLocationRequirements" in ld:
-                                job_data["eligible_countries"] = [
-                                    c["name"] for c in ld["applicantLocationRequirements"]
-                                    if isinstance(c, dict) and "name" in c
-                                ]
-
-                            org = ld.get("hiringOrganization", {})
-                            if isinstance(org, dict):
-                                if not job_data.get("company"):
-                                    job_data["company"] = org.get("name")
-                                # sameAs is more reliable than footer link
-                                if org.get("sameAs"):
-                                    job_data["company_website"] = org["sameAs"]
-                                if not job_data.get("company_logo") and org.get("logo"):
-                                    job_data["company_logo"] = org["logo"]
-                except:
-                    pass
-
-                browser.close()
-
-                has_content = bool(
-                    job_data.get("description") or
-                    job_data.get("requirements") or
-                    job_data.get("location")
-                )
-                if has_content:
-                    return job_data
-                elif attempt < MAX_RETRIES - 1:
-                    time.sleep(RETRY_DELAY_BASE * (2 ** attempt))
-                    continue
-                return job_data if job_data.get("title") else None
+                    return job_data if job_data.get("title") else None
 
         except Exception as e:
             logger.error(f"Stealth DOM detail attempt {attempt + 1} failed: {e}")
