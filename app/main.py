@@ -5,7 +5,7 @@ load_dotenv()
 from fastapi import FastAPI, Query, HTTPException
 from urllib.parse import urljoin, urlparse
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
-from playwright_stealth import StealthConfig
+from playwright_stealth import stealth_sync
 import requests
 from datetime import datetime, timedelta, timezone
 import re
