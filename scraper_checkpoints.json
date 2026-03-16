@@ -6,5 +6,37 @@
     "last_published": "2026-02-27",
     "total_jobs_seen": 8,
     "run_count": 1
+  },
+  "https://apply.workable.com/neo-gg": {
+    "last_run_at": "2026-03-16T12:40:10.190301+00:00",
+    "last_job_url": "",
+    "last_job_title": "",
+    "last_published": "",
+    "total_jobs_seen": 10,
+    "run_count": 2
+  },
+  "https://apply.workable.com/storytoys": {
+    "last_run_at": "2026-03-16T12:41:39.748006+00:00",
+    "last_job_url": "",
+    "last_job_title": "",
+    "last_published": "",
+    "total_jobs_seen": 1,
+    "run_count": 2
+  },
+  "https://apply.workable.com/mercier-consultancy-md": {
+    "last_run_at": "2026-03-16T12:45:52.818703+00:00",
+    "last_job_url": "",
+    "last_job_title": "",
+    "last_published": "",
+    "total_jobs_seen": 2,
+    "run_count": 2
+  },
+  "https://apply.workable.com/thinkingit": {
+    "last_run_at": "2026-03-16T12:26:45.851799+00:00",
+    "last_job_url": "",
+    "last_job_title": "",
+    "last_published": "",
+    "total_jobs_seen": 9,
+    "run_count": 1
   }
 }
