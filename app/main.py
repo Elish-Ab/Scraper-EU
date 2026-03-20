@@ -641,6 +641,7 @@ def _fetch_api_dates_in_browser(page, account: str) -> dict:
 # ============================================================================
 # GET JOB LINKS — STEALTH DOM FIRST, API FALLBACK
 # ============================================================================
+
 def get_links_from_dom_stealth(board_url: str, since_dt: datetime = None) -> list:
     clean_url = board_url.split('#')[0].rstrip('/')
     account   = _account_from_board_url(clean_url)
@@ -683,7 +684,13 @@ def get_links_from_dom_stealth(board_url: str, since_dt: datetime = None) -> lis
                         try:
                             page.goto(clean_url, wait_until="domcontentloaded", timeout=40000)
                         except PlaywrightTimeout:
-                            logger.warning("   Navigation timeout, continuing...")
+                            logger.warning("   Navigation timeout")
+                            browser.close()
+                            # Timeout on proxy → try direct immediately
+                            if use_proxy:
+                                proxy_blocked = True
+                                logger.warning("   Treating timeout as proxy block → retrying direct...")
+                            continue
 
                         page.wait_for_timeout(random.randint(3000, 5000))
                         try:
@@ -863,7 +870,7 @@ def get_links_from_dom_stealth(board_url: str, since_dt: datetime = None) -> lis
 
                 if not all_jobs:
                     if use_proxy and proxy_blocked:
-                        logger.warning("   Proxy 402, retrying direct...")
+                        logger.warning("   Proxy blocked, retrying direct...")
                         continue
                     break
 
@@ -872,14 +879,11 @@ def get_links_from_dom_stealth(board_url: str, since_dt: datetime = None) -> lis
                 missing_posted  = any(not j.get("posted") for j in structured_jobs)
 
                 if missing_posted and account and since_dt:
-                    # DOM has no dates → delegate entirely to API which handles
-                    # pagination correctly and returns accurate published dates
                     logger.info(f"   ⚠️  DOM missing posted dates → delegating to API for '{account}'...")
                     api_jobs = get_links_from_api(board_url, since_dt=since_dt)
                     if api_jobs:
                         logger.info(f"✅ API date filter: {len(api_jobs)} jobs")
                         return api_jobs
-                    # API returned nothing → return all DOM jobs unfiltered
                     logger.warning("   API returned nothing → returning DOM jobs unfiltered")
                     seen   = set()
                     unique = []
@@ -908,10 +912,8 @@ def get_links_from_dom_stealth(board_url: str, since_dt: datetime = None) -> lis
                             if job_dt < since_dt:
                                 continue
 
-                    # No date info at all → include
                     filtered.append(job)
 
-                # Deduplicate by URL
                 seen   = set()
                 unique = []
                 for job in filtered:
@@ -933,10 +935,13 @@ def get_links_from_dom_stealth(board_url: str, since_dt: datetime = None) -> lis
     return []
 
 
-# ============================================================================
-# GET LINKS FROM API — also used as date-filter fallback when DOM has no dates
-# ============================================================================
 def get_links_from_api(board_url: str, since_dt: datetime = None) -> list:
+    """
+    Get job links via Workable API.
+    Used as:
+      1. Last resort when all DOM methods fail
+      2. Date-filter fallback when DOM board page has no posted dates
+    """
     try:
         clean_url = board_url.split('#')[0].rstrip('/')
         subdomain = clean_url.strip("/").split("/")[-1]
@@ -949,15 +954,25 @@ def get_links_from_api(board_url: str, since_dt: datetime = None) -> list:
         try:
             with playwright_semaphore:
                 with sync_playwright() as p:
+                    # use_proxy=False — direct connection works for API
+                    # and avoids proxy timeouts that affect some boards
                     browser, page = new_stealth_page(p, use_proxy=False)
-                    page.goto(clean_url, wait_until="domcontentloaded", timeout=60000)
-                    try:
-                        page.wait_for_load_state("networkidle", timeout=10000)
-                    except:
-                        pass
-                    page.wait_for_timeout(random.randint(2000, 3000))
 
-                    # Fetch all pages inside the browser — session cookies kept valid
+                    # Load the root domain, not the board page — much faster,
+                    # still gives valid session cookies for API calls
+                    try:
+                        page.goto(
+                            "https://apply.workable.com",
+                            wait_until="domcontentloaded",
+                            timeout=30000
+                        )
+                    except PlaywrightTimeout:
+                        logger.warning("   Root page timeout, proceeding anyway...")
+
+                    page.wait_for_timeout(random.randint(1000, 2000))
+
+                    # Fetch all pages inside the browser — session cookies kept
+                    # valid so the nextPage token works across all pages
                     result = page.evaluate("""
 (async ({ apiUrl }) => {
     const allJobs = [];
@@ -1027,6 +1042,9 @@ def get_links_from_api(board_url: str, since_dt: datetime = None) -> list:
 
         logger.info(f"   After date filter: {len(filtered)} jobs (from {len(all_results)} total)")
 
+        if not filtered:
+            return []
+
         # Build final job list — dedupe by shortcode
         seen_shortcodes = set()
         final_jobs = []
@@ -1036,15 +1054,15 @@ def get_links_from_api(board_url: str, since_dt: datetime = None) -> list:
                 continue
             seen_shortcodes.add(sc)
 
-            locations = job.get("locations", [])
-            countries = sorted({loc.get("country") for loc in locations if loc.get("country")})
-            url = urljoin(board_url, f"j/{sc}/")
+            locations     = job.get("locations", [])
+            countries     = sorted({loc.get("country") for loc in locations if loc.get("country")})
+            job_published = job.get("published", "")
 
             final_jobs.append({
-                "url":           url,
+                "url":           urljoin(board_url, f"j/{sc}/"),
                 "jobId":         sc,
                 "title":         job.get("title", ""),
-                "published":     pub_str[:10] if pub_str else "",
+                "published":     job_published[:10] if job_published else "",
                 "remote":        job.get("remote", False),
                 "workplace":     job.get("workplace", ""),
                 "type":          job.get("type", ""),
@@ -1060,6 +1078,9 @@ def get_links_from_api(board_url: str, since_dt: datetime = None) -> list:
     except Exception as e:
         logger.error(f"API error: {e}")
         return []
+# ============================================================================
+# GET LINKS FROM API — also used as date-filter fallback when DOM has no dates
+# ============================================================================
 # ============================================================================
 # GET JOB DETAILS — DOM PRIMARY, API FALLBACK
 # ============================================================================
