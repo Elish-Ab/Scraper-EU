@@ -1,1 +1,39 @@
-[]
+[
+  {
+    "url": "https://apply.workable.com/learnworlds/j/933489167B/",
+    "jobId": "933489167B",
+    "title": "Senior Full Stack Software Engineer (Remote, Greece & Cyprus)",
+    "posted": "Posted 1 day ago",
+    "workplace": "Remote",
+    "locations": [
+      "Athens, Attica, Greece",
+      "Greece",
+      "Cyprus",
+      "Thessaloniki, Central Macedonia, Greece",
+      "Heraklion, Crete, Greece",
+      "Larissa, Thessalia, Greece"
+    ],
+    "location": "Athens, Attica, Greece",
+    "department": "Engineering",
+    "method": "stealth_dom",
+    "account": "learnworlds",
+    "company": "LearnWorlds",
+    "company_logo": "https://workablehr.s3.amazonaws.com/uploads/account/logo/294505/logo",
+    "description": "<h2 id=\"job-description-title\">Description</h2><div><p>At LearnWorlds, we believe learning is the original human superpower \u2014 the force that turns knowledge into products, skills, and progress.</p><p>Our platform helps creators, educators, and organizations in more than 150 countries turn expertise into scalable learning experiences that sell, teach, and transform. As AI floods the world with information, learning becomes the only countermeasure \u2014 the skill that keeps humans creative, relevant, and in control. The winners won\u2019t be those who automate fastest, but those who learn and adapt fastest. They\u2019ll need platforms that turn knowledge into teachable systems that scale \u2014 and that\u2019s exactly what LearnWorlds enables.<strong><br><br>Build. Ship. Learn. Improve. (Repeat.)</strong></p><p>We\u2019re redefining how people create and share online learning\u2014and we\u2019re doing it with engineers who care deeply about product quality, clean architecture, and meaningful impact.</p><p>We\u2019re a remote-first, fast-growing EdTech SaaS with a global footprint. Our Engineering team builds the core experiences that thousands of educators and learners rely on daily. We move fast, we collaborate tightly, and we\u2019re constantly leveling up\u2014both as individuals and as a team.</p><p>We\u2019re now looking for a Senior Full Stack Software Engineer who thrives in full-stack ownership, has strong frontend instincts (Vue.js), solid backend fundamentals (PHP), and is excited to use AI-assisted coding to speed up iteration without sacrificing quality.</p><p>If you\u2019re a proactive builder who loves solving real product challenges, this is where you\u2019ll do your best work.</p><h3>&nbsp;What You\u2019ll Be Doing</h3><ul><li>Design and ship full-stack features that delight users\u2014from backend logic to pixel-perfect frontend.</li><li>Get your hands dirty with complex modules like our Interactive Video Authoring Tool or marketing automation workflows.</li><li>Write clean, scalable backend services in PHP, focusing on performance, robustness, and maintainability.</li><li>Build responsive, modern UIs in Vue.js, ensuring smooth interactions and high-quality UX.</li><li>Collaborate closely with PMs, designers, and engineers in fast feedback loops\u2014we experiment, iterate, and ship.</li><li>Participate in deep, structured code reviews and help shape engineering standards.</li><li>Use AI-powered coding tools (Copilot, ChatGPT, Claude, Cursor) to accelerate development, exploration, and testing.</li><li>Squash bugs, refactor when needed, and always be on the lookout for better ways to do things.</li></ul><p></p><h3>&nbsp;Why You\u2019ll Love This Role</h3><ul><li>You\u2019ll work on real features used by thousands of educators and most importantly tens of millions of learners around the world.</li><li>You\u2019ll touch both frontend and backend, optimizing performance, building new tools, and improving existing ones.</li><li>You\u2019ll be part of a tight-knit team where your ideas matter and your code ships fast.</li><li>You\u2019ll grow fast\u2014technically and professionally\u2014in a team that\u2019s generous with knowledge and big on collaboration.</li></ul><h3>You\u2019ll Thrive Here If You\u2026</h3><ul><li>Prefer ownership over hand-holding and clarity over bureaucracy.</li><li>Think speed and quality can (and should) co-exist.</li><li>Ask \u201cwhy\u201d before \u201chow,\u201d and make decisions with context, not just checklists.</li><li>Love clean code, good architecture, and continuous improvement.</li><li>Embrace feedback, stay curious, and enjoy sharing knowledge.</li><li>Believe AI won\u2019t replace engineers\u2014but it will empower the best ones.</li></ul></div>",
+    "requirements": "<h2 id=\"job-requirements-title\">Requirements</h2><div><h3>Must-haves</h3><ul><li>7+ years of professional experience as a Full Stack Developer.</li><li>Strong proficiency in PHP and modern JavaScript\u2014preferably with Vue.js.</li><li>Deep understanding of RESTful APIs, HTTP fundamentals, and modern frontend application architecture.</li><li>Strong experience with both relational (MySQL, PostgreSQL) and noSQL (MongoDB) databases.</li><li>Excellent debugging, problem-solving, and performance optimization skills.</li><li>High attention to detail and a product-oriented mindset.</li><li>Native or near-native Greek speaker.<br></li></ul><h3>Nice-to-haves</h3><ul><li>Experience with Docker, Kubernetes, or microservices architectures.</li><li>Exposure to or interest in Go.</li><li>Experience in EdTech, LMS systems, or other complex SaaS products.</li><li>GitHub repos, open-source contributions, or personal projects you\u2019re proud of.</li></ul></div>",
+    "benefits": "<h2 id=\"job-benefits-title\">Benefits</h2><div><p></p><ul> <li>Private life and health insurance plan</li> <li>Fully remote work if you prefer to work from home, apart from when we have team meetings a few times per year</li> <li>Your personal annual training budget</li> <li>An annual home office allowance to set up your personal space</li> <li>Company laptop &amp; monitor</li> <li>23 days of paid time off</li> <li>3 early summer Fridays in July and August</li> <li>A free LearnWorlds School to build and sell your own courses</li> <li>Work in one of the globally top 5 e-learning courses platform</li> <li>An opportunity to grow alongside us and shape the look and feel of tomorrow's e-learning</li> <li>An entrepreneurial, international, and highly motivated team with a flat hierarchy that will both challenge you and help you reach your highest potential</li> <li>Annual company retreats (<a tabindex=\"0\" data-role=\"button-link\" class=\"button--2de5X button--14TuV tertiary--1JsWJ external\" rel=\"nofollow noreferrer noopener\" target=\"_blank\" href=\"https://www.youtube.com/watch?v=NdjakCVXXw8\">see the video of our latest retreat</a>).</li> </ul></div>",
+    "apply_url": "https://apply.workable.com/learnworlds/j/933489167B/apply/",
+    "company_website": "http://www.learnworlds.com",
+    "published": "2026-03-18",
+    "remote": true,
+    "eligible_countries": [
+      "Greece",
+      "Greece",
+      "Cyprus",
+      "Greece",
+      "Greece",
+      "Greece"
+    ],
+    "scraped_at": "2026-03-20T13:27:38.932109+00:00"
+  }
+]

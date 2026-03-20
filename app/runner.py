@@ -1,6 +1,7 @@
 import json
 import requests
 import os
+from datetime import datetime, timezone
 
 API_BASE = "https://scraper-eu-production.up.railway.app"
 DAYS = 5
@@ -13,8 +14,6 @@ def load_sources(filename):
         return json.load(f)
 
 def save_job(job: dict):
-    """Append a single job to the output file immediately."""
-    # Read existing
     if os.path.exists(OUTPUT_FILE):
         with open(OUTPUT_FILE) as f:
             try:
@@ -23,9 +22,7 @@ def save_job(job: dict):
                 all_jobs = []
     else:
         all_jobs = []
-
     all_jobs.append(job)
-
     with open(OUTPUT_FILE, "w") as f:
         json.dump(all_jobs, f, indent=2)
 
@@ -45,8 +42,15 @@ def scrape_board(board_url) -> list:
 
     results = []
     for i, job in enumerate(jobs, 1):
-        job_url = job.get("url") if isinstance(job, dict) else job
-        print(f"    [{i}/{len(jobs)}] {job_url}")
+        job_url    = job.get("url") if isinstance(job, dict) else job
+        posted     = job.get("posted", "")      # e.g. "Posted 2 days ago"
+        published  = job.get("published", "")   # e.g. "2026-03-19"
+        title      = job.get("title", "?")
+
+        date_str = published or posted or "no date"
+        print(f"    [{i}/{len(jobs)}] {title[:50]} | 📅 {date_str}")
+        print(f"           {job_url}")
+
         try:
             detail_resp = requests.get(
                 f"{API_BASE}/get-job-details",
@@ -59,7 +63,15 @@ def scrape_board(board_url) -> list:
             print(f"      ❌ {e}")
             merged = job if isinstance(job, dict) else {"url": job_url}
 
-        # ✅ Save immediately as each job completes
+        # Ensure published date is always set on the merged job
+        if not merged.get("published") and published:
+            merged["published"] = published
+        if not merged.get("posted") and posted:
+            merged["posted"] = posted
+
+        # Add scrape timestamp
+        merged["scraped_at"] = datetime.now(timezone.utc).isoformat()
+
         save_job(merged)
         results.append(merged)
         print(f"      💾 Saved ({len(results)} total so far)")
@@ -84,3 +96,13 @@ for board in lever_boards:
     all_jobs.extend(scrape_board(board["url"]))
 
 print(f"\n✅ Total: {len(all_jobs)} jobs → {OUTPUT_FILE}")
+
+# Summary by date
+if all_jobs:
+    by_date = {}
+    for job in all_jobs:
+        date = job.get("published") or job.get("posted") or "unknown"
+        by_date[date] = by_date.get(date, 0) + 1
+    print("\n📊 Jobs by date:")
+    for date in sorted(by_date.keys(), reverse=True):
+        print(f"   {date}: {by_date[date]} jobs")
