@@ -38,5 +38,37 @@
     "last_published": "",
     "total_jobs_seen": 9,
     "run_count": 1
+  },
+  "https://apply.workable.com/constructor-1": {
+    "last_run_at": "2026-04-02T13:07:38.795124+00:00",
+    "last_job_url": "https://apply.workable.com/constructor-1/j/ACBA7B61A3/",
+    "last_job_title": "Sales Development Representative EMEA (Italian/Spanish, Remote)",
+    "last_published": "2026-04-01",
+    "total_jobs_seen": 1,
+    "run_count": 1
+  },
+  "https://jobs.ashbyhq.com/wayflyer": {
+    "last_run_at": "2026-04-02T13:08:03.260688+00:00",
+    "last_job_url": "",
+    "last_job_title": "",
+    "last_published": "",
+    "total_jobs_seen": 30,
+    "run_count": 1
+  },
+  "https://jobs.ashbyhq.com/tribe-xyz": {
+    "last_run_at": "2026-04-02T13:25:50.730349+00:00",
+    "last_job_url": "",
+    "last_job_title": "",
+    "last_published": "",
+    "total_jobs_seen": 3,
+    "run_count": 1
+  },
+  "https://jobs.ashbyhq.com/windranger": {
+    "last_run_at": "2026-04-02T13:29:38.750558+00:00",
+    "last_job_url": "",
+    "last_job_title": "",
+    "last_published": "",
+    "total_jobs_seen": 7,
+    "run_count": 1
   }
 }

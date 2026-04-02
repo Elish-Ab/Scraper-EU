@@ -19,6 +19,8 @@ import os
 from collections import defaultdict
 
 from app.lever_scraper import extract_job_with_lever_api, get_links_from_lever_api, is_lever_url
+from app.ashby_scraper import get_links_from_ashby, extract_job_with_ashby, is_ashby_url
+
 from app.checkpoint import (
     get_checkpoint,
     save_checkpoint,
@@ -1370,7 +1372,7 @@ def extract_job_with_api(account: str, shortcode: str, job_url: str):
 
 @app.get("/get-job-links")
 def get_job_links(
-    url: str = Query(..., description="Workable or Lever board URL"),
+    url: str = Query(..., description="Workable, Lever, or Ashby board URL"),
     days: float = Query(0, description="Fetch jobs posted within last N days (e.g. 5, 1.5). 0 = use checkpoint or all"),
     hours: float = Query(0, description="Fetch jobs posted within last N hours (e.g. 24). Overrides days if set"),
     use_checkpoint: bool = Query(True, description="Resume from last saved checkpoint when days/hours=0"),
@@ -1393,6 +1395,15 @@ def get_job_links(
 
         since_str = since_dt.isoformat() if since_dt else None
         logger.info(f"📅 Effective since_dt: {since_str}")
+
+        # ---- Ashby ----
+        if is_ashby_url(url):
+            jobs = get_links_from_ashby(url, since_dt=since_dt)
+            if jobs:
+                rate_limiter.record_success(domain)
+                _maybe_save_checkpoint(url, jobs, save_progress)
+                return {"success": True, "total": len(jobs), "jobs": jobs, "method": "ashby_api", "since": since_str}
+            return {"success": True, "total": 0, "jobs": [], "note": "No Ashby jobs found", "since": since_str}
 
         # ---- Lever ----
         if is_lever_url(url):
@@ -1445,8 +1456,7 @@ def get_job_links(
     except Exception as e:
         logger.error(f"Error: {e}")
         return {"success": False, "total": 0, "jobs": [], "error": str(e)}
-
-
+    
 def _maybe_save_checkpoint(board_url: str, jobs: list, save_progress: bool):
     if not save_progress or not jobs:
         return
@@ -1473,13 +1483,23 @@ def _maybe_save_checkpoint(board_url: str, jobs: list, save_progress: bool):
 
 
 @app.get("/get-job-details")
-def get_job_details(url: str = Query(..., description="Workable or Lever job URL")):
+def get_job_details(url: str = Query(..., description="Workable, Lever, or Ashby job URL")):
     logger.info(f"\n🎯 GET DETAILS: {url}")
 
     try:
         domain = urlparse(url).netloc
         rate_limiter.wait_if_needed(domain)
 
+        # ---- Ashby ----
+        if is_ashby_url(url):
+            result = extract_job_with_ashby(url)
+            if result and result.get("title"):
+                result["method"] = "ashby_dom"
+                rate_limiter.record_success(domain)
+                return {"success": True, "job": result}
+            return {"success": False, "error": "Ashby scrape failed", "url": url}
+
+        # ---- Lever ----
         if is_lever_url(url):
             result = extract_job_with_lever_api(url)
             if result and result.get("title"):
@@ -1488,6 +1508,7 @@ def get_job_details(url: str = Query(..., description="Workable or Lever job URL
                 return {"success": True, "job": result}
             return {"success": False, "error": "Lever API failed", "url": url}
 
+        # ---- Workable ----
         account, shortcode, _ = _parse_workable_url(url)
 
         result = extract_job_with_dom_stealth(url, account, shortcode)
@@ -1509,7 +1530,6 @@ def get_job_details(url: str = Query(..., description="Workable or Lever job URL
         raise
     except Exception as e:
         return {"success": False, "error": str(e), "url": url}
-
 
 # ============================================================================
 # CHECKPOINT ENDPOINTS
