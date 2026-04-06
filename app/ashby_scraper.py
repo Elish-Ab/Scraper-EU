@@ -1,9 +1,10 @@
 # app/ashby_scraper.py
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from urllib.parse import urlparse
 import logging
 import random
 import requests
+import json
 from bs4 import BeautifulSoup
 
 logger = logging.getLogger(__name__)
@@ -56,9 +57,6 @@ def is_ashby_url(url: str) -> bool:
 
 
 def parse_ashby_board_url(board_url: str) -> str:
-    """Extract company slug from board URL.
-    e.g. https://jobs.ashbyhq.com/wayflyer → wayflyer
-    """
     parts = [p for p in urlparse(board_url).path.strip("/").split("/") if p]
     if not parts:
         raise ValueError(f"Cannot parse Ashby board URL: {board_url}")
@@ -66,9 +64,6 @@ def parse_ashby_board_url(board_url: str) -> str:
 
 
 def parse_ashby_job_url(job_url: str) -> tuple[str, str]:
-    """Extract company slug and job ID from job URL.
-    e.g. https://jobs.ashbyhq.com/tribe-xyz/320651d4-... → (tribe-xyz, 320651d4-...)
-    """
     parts = [p for p in urlparse(job_url).path.strip("/").split("/") if p]
     if len(parts) < 2:
         raise ValueError(f"Cannot parse Ashby job URL: {job_url}")
@@ -76,15 +71,85 @@ def parse_ashby_job_url(job_url: str) -> tuple[str, str]:
 
 
 # ============================================================================
-# GRAPHQL API — board listing with published dates
+# __appData EXTRACTOR — primary source, has publishedDate
 # ============================================================================
+
+def _extract_app_data(html: str) -> dict | None:
+    """Extract window.__appData JSON from Ashby board page HTML."""
+    marker = "window.__appData = "
+    pos = html.find(marker)
+    if pos == -1:
+        return None
+    start = html.find("{", pos)
+    if start == -1:
+        return None
+
+    depth = 0
+    end   = None
+    in_str = False
+    escape = False
+    for i in range(start, len(html)):
+        c = html[i]
+        if escape:
+            escape = False
+            continue
+        if c == "\\" and in_str:
+            escape = True
+            continue
+        if c == '"' and not escape:
+            in_str = not in_str
+            continue
+        if in_str:
+            continue
+        if c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                end = i + 1
+                break
+
+    if end is None:
+        return None
+
+    try:
+        return json.loads(html[start:end])
+    except Exception as e:
+        logger.warning(f"   __appData JSON parse failed: {e}")
+        return None
+
 
 def _fetch_ashby_api(company: str) -> list:
     """
-    Fetch all job postings via Ashby GraphQL API.
-    Returns list of raw job dicts with: id, title, teamId, locationName,
-    workplaceType, employmentType, secondaryLocations, publishedAt
+    Fetch job postings from window.__appData in the board page HTML.
+    __appData contains publishedDate (e.g. "2026-01-29") which the
+    GraphQL API does not expose. Falls back to GraphQL if page parsing fails.
     """
+    board_url = f"{ASHBY_BASE}/{company}/"
+    headers = {
+        "User-Agent": random.choice(USER_AGENTS),
+        "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+
+    try:
+        resp = requests.get(board_url, headers=headers, timeout=30)
+        if resp.status_code == 200:
+            app_data = _extract_app_data(resp.text)
+            if app_data:
+                job_postings = app_data.get("jobBoard", {}).get("jobPostings", [])
+                if job_postings:
+                    logger.info(f"   Ashby __appData: {len(job_postings)} jobs for '{company}'")
+                    return job_postings
+    except Exception as e:
+        logger.warning(f"   Ashby board page fetch failed: {e}")
+
+    logger.warning(f"   Falling back to GraphQL for '{company}'")
+    return _fetch_ashby_graphql(company)
+
+
+def _fetch_ashby_graphql(company: str) -> list:
+    """GraphQL fallback — no publishedDate available."""
     headers = {
         "Content-Type": "application/json",
         "Accept": "application/json",
@@ -100,35 +165,26 @@ def _fetch_ashby_api(company: str) -> list:
     try:
         resp = requests.post(ASHBY_API, json=payload, headers=headers, timeout=20)
         if resp.status_code != 200:
-            logger.warning(f"   Ashby API status {resp.status_code}")
             return []
-        data = resp.json()
-        board = data.get("data", {}).get("jobBoard", {})
+        data         = resp.json()
+        board        = data.get("data", {}).get("jobBoard", {})
         teams        = board.get("teams", [])
         job_postings = board.get("jobPostings", [])
-        # Build team id → name map
         team_map = {t["id"]: t["name"] for t in teams}
-        # Attach team name to each job
         for job in job_postings:
             job["teamName"] = team_map.get(job.get("teamId"), "")
-        logger.info(f"   Ashby API: {len(job_postings)} jobs for '{company}'")
+        logger.info(f"   Ashby GraphQL: {len(job_postings)} jobs for '{company}'")
         return job_postings
     except Exception as e:
-        logger.warning(f"   Ashby API failed: {e}")
+        logger.warning(f"   Ashby GraphQL failed: {e}")
         return []
 
 
 # ============================================================================
-# BOARD PAGE — DOM SCRAPER
+# BOARD PAGE — DOM SCRAPER (last resort fallback)
 # ============================================================================
 
 def _scrape_ashby_board_dom(board_url: str, company: str) -> list:
-    """
-    Scrape board page HTML for job listings.
-    Returns list of dicts with: url, jobId, title, department,
-    location, type, workplace
-    Note: no published date in DOM — always use API for dates.
-    """
     headers = {
         "User-Agent": random.choice(USER_AGENTS),
         "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
@@ -144,37 +200,24 @@ def _scrape_ashby_board_dom(board_url: str, company: str) -> list:
 
     soup = BeautifulSoup(resp.text, "html.parser")
     jobs = []
-
-    # Each department group has an h2 heading followed by job links
-    for group in soup.select("div._departments_1cp2r_345 > *"):
-        # Track current department as we iterate siblings
-        pass
-
-    # Simpler: iterate all job links and find preceding department heading
     current_dept = ""
+
     for el in soup.select("div._departments_1cp2r_345 h2, a._container_j2da7_1"):
         if el.name == "h2":
             current_dept = el.get_text(strip=True)
             continue
-
         if el.name != "a":
             continue
 
         href = el.get("href", "")
         if not href:
             continue
-
-        # Job ID is last path segment (UUID)
         path_parts = [p for p in href.strip("/").split("/") if p]
         if len(path_parts) < 2:
             continue
         job_id = path_parts[-1]
-
-        # Skip /application links
         if job_id == "application":
             continue
-
-        url = f"{ASHBY_BASE}{href}"
 
         title_el = el.select_one("h3.ashby-job-posting-brief-title")
         if not title_el:
@@ -183,18 +226,10 @@ def _scrape_ashby_board_dom(board_url: str, company: str) -> list:
         if not title:
             continue
 
-        # Details line: "Department • Location • Type • Workplace"
         details_el = el.select_one("div.ashby-job-posting-brief-details p")
-        location  = ""
-        job_type  = ""
-        workplace = ""
-
+        location = job_type = workplace = ""
         if details_el:
             parts = [p.strip() for p in details_el.get_text().split("•")]
-            # parts[0] = dept/company name (skip — use heading dept instead)
-            # parts[1] = location(s)
-            # parts[2] = employment type
-            # parts[3] = workplace type
             if len(parts) >= 2:
                 location = parts[1].strip()
             if len(parts) >= 3:
@@ -203,13 +238,14 @@ def _scrape_ashby_board_dom(board_url: str, company: str) -> list:
                 workplace = parts[3].strip()
 
         jobs.append({
-            "url":        url,
+            "url":        f"{ASHBY_BASE}{href}",
             "jobId":      job_id,
             "title":      title,
             "department": current_dept,
             "location":   location,
             "type":       job_type,
             "workplace":  workplace,
+            "published":  "",
             "method":     "dom",
         })
 
@@ -218,27 +254,53 @@ def _scrape_ashby_board_dom(board_url: str, company: str) -> list:
 
 
 # ============================================================================
-# GET LINKS — API PRIMARY (has dates), DOM fallback
+# GET LINKS — __appData primary, GraphQL fallback, DOM last resort
 # ============================================================================
 
 def get_links_from_ashby(board_url: str, since_dt: datetime = None) -> list:
+    """
+    Get Ashby job listings.
+
+    Step 1 — Parse window.__appData from board page HTML:
+        Contains publishedDate (e.g. "2026-01-29") for date filtering.
+
+    Step 2 — Date filter using publishedDate.
+
+    Step 3 — GraphQL API fallback (no dates).
+
+    Step 4 — DOM fallback (no dates, last resort).
+    """
     try:
         company = parse_ashby_board_url(board_url)
     except ValueError as e:
         logger.error(str(e))
         return []
 
-    if since_dt:
-        logger.info(f"   ⚠️  Ashby has no published dates — returning all jobs")
-
     api_jobs = _fetch_ashby_api(company)
 
     if not api_jobs:
-        logger.warning(f"   Ashby API failed → falling back to DOM for '{company}'")
+        logger.warning(f"   Ashby all API methods failed → DOM fallback for '{company}'")
         return _scrape_ashby_board_dom(board_url, company)
 
+    # Date filter using publishedDate from __appData
+    # GraphQL fallback jobs won't have publishedDate → include all
+    filtered = []
+    for posting in api_jobs:
+        if since_dt:
+            pub_str = posting.get("publishedDate", "")
+            if pub_str:
+                try:
+                    pub_date = datetime.fromisoformat(pub_str[:10]).replace(tzinfo=timezone.utc)
+                    if pub_date < since_dt:
+                        continue
+                except:
+                    pass  # unparseable → include
+        filtered.append(posting)
+
+    logger.info(f"   After date filter: {len(filtered)} jobs (from {len(api_jobs)} total)")
+
     jobs = []
-    for posting in api_jobs:  # ← renamed from 'job' to 'posting' to avoid shadowing
+    for posting in filtered:
         posting_id = posting.get("id", "")
         if not posting_id:
             continue
@@ -250,46 +312,54 @@ def get_links_from_ashby(board_url: str, since_dt: datetime = None) -> list:
             if s.get("locationName")
         ]
         all_locations = [l.strip() for l in ([primary_loc] + secondary_locs) if l.strip()]
+        pub_raw       = posting.get("publishedDate", "")  # from __appData
+
+        # teamName is already in __appData; GraphQL fallback sets it via team_map
+        department = posting.get("teamName", "")
 
         jobs.append({
             "url":        f"{ASHBY_BASE}/{company}/{posting_id}",
             "jobId":      posting_id,
             "title":      posting.get("title", ""),
-            "department": posting.get("teamName", ""),
+            "department": department,
             "location":   all_locations[0] if all_locations else "",
             "locations":  all_locations if len(all_locations) > 1 else None,
-            "type":       posting.get("employmentType", ""),
-            "type": "Full time" if posting.get("employmentType") == "FullTime" else posting.get("employmentType", ""),
+            "type":       "Full time" if posting.get("employmentType") == "FullTime" else posting.get("employmentType", ""),
             "workplace":  posting.get("workplaceType", ""),
-            "published":  "",
+            "published":  pub_raw[:10] if pub_raw else "",
             "method":     "api",
         })
 
     logger.info(f"✅ Ashby: {len(jobs)} jobs for '{company}'")
     return jobs
-    # ── STEP 3: DOM fallback (no dates) ───────────────────────────
-
-    logger.warning(f"   Ashby API failed → falling back to DOM for '{company}'")
-    dom_jobs = _scrape_ashby_board_dom(board_url, company)
-    logger.info(f"✅ Ashby DOM fallback: {len(dom_jobs)} jobs")
-    return dom_jobs
 
 
 # ============================================================================
-# JOB DETAIL — DOM PRIMARY
+# JOB DETAIL — Playwright (React-rendered page)
 # ============================================================================
+
 def extract_job_with_ashby(job_url: str) -> dict | None:
+    """
+    Scrape Ashby job detail page using Playwright (React-rendered).
+
+    Confirmed selectors (tribe-xyz, wayflyer):
+      title           h1.ashby-job-posting-heading
+      location        .ashby-job-posting-left-pane section h2="Location" → p
+      employment_type .ashby-job-posting-left-pane section h2="Employment Type" → p
+      workplace       .ashby-job-posting-left-pane section h2="Location Type" → p
+      department      .ashby-job-posting-left-pane section h2="Department" → p
+      description     .ashby-job-posting-right-pane [role="tabpanel"]
+      apply_url       a[href*="/application"]
+    """
     try:
         company, job_id = parse_ashby_job_url(job_url)
     except ValueError as e:
         logger.error(str(e))
         return None
 
-    # Ashby renders via React — need a real browser
     try:
         from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
         import threading
-        # Import semaphore from main to avoid concurrent browser launches
         try:
             from app.main import playwright_semaphore
         except ImportError:
@@ -314,7 +384,7 @@ def extract_job_with_ashby(job_url: str) -> dict | None:
                     browser.close()
                     return None
 
-                # Wait for React to render
+                # Wait for React to render title
                 try:
                     page.wait_for_selector("h1.ashby-job-posting-heading", timeout=10000)
                 except:
@@ -339,7 +409,7 @@ def extract_job_with_ashby(job_url: str) -> dict | None:
                     browser.close()
                     return None
 
-                # Left pane metadata
+                # Left pane metadata sections
                 try:
                     for section in page.query_selector_all(".ashby-job-posting-left-pane div"):
                         heading = section.query_selector("h2")
@@ -355,14 +425,14 @@ def extract_job_with_ashby(job_url: str) -> dict | None:
                         elif label == "location type":
                             job_data["workplace"] = text
                         elif label == "department":
-    # May have nested spans like "Revenue\nSales" → "Revenue > Sales"
+                            # Nested dept headings e.g. "Revenue\nSales" → "Revenue > Sales"
                             job_data["department"] = " > ".join(
                                 line.strip() for line in text.splitlines() if line.strip()
                             )
                 except:
                     pass
 
-                # Description
+                # Description (right pane overview tab)
                 try:
                     el = page.query_selector(".ashby-job-posting-right-pane [role='tabpanel']")
                     if not el:
