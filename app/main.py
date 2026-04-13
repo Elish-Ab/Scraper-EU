@@ -20,6 +20,7 @@ from collections import defaultdict
 
 from app.lever_scraper import extract_job_with_lever_api, get_links_from_lever_api, is_lever_url
 from app.ashby_scraper import get_links_from_ashby, extract_job_with_ashby, is_ashby_url
+from app.greenhouse_scraper import get_links_from_greenhouse, extract_job_with_greenhouse, is_greenhouse_url
 
 from app.checkpoint import (
     get_checkpoint,
@@ -1405,6 +1406,15 @@ def get_job_links(
                 return {"success": True, "total": len(jobs), "jobs": jobs, "method": "ashby_api", "since": since_str}
             return {"success": True, "total": 0, "jobs": [], "note": "No Ashby jobs found", "since": since_str}
 
+        # ---- Greenhouse ---- 
+        if is_greenhouse_url(url):
+            jobs = get_links_from_greenhouse(url, since_dt=since_dt)
+            if jobs:
+                rate_limiter.record_success(domain)
+                _maybe_save_checkpoint(url, jobs, save_progress)
+                return {"success": True, "total": len(jobs), "jobs": jobs, "method": "greenhouse_api", "since": since_str}
+            return {"success": True, "total": 0, "jobs": [], "note": "No Greenhouse jobs found", "since": since_str}
+
         # ---- Lever ----
         if is_lever_url(url):
             links = get_links_from_lever_api(url, since_dt=since_dt)
@@ -1498,6 +1508,15 @@ def get_job_details(url: str = Query(..., description="Workable, Lever, or Ashby
                 rate_limiter.record_success(domain)
                 return {"success": True, "job": result}
             return {"success": False, "error": "Ashby scrape failed", "url": url}
+        
+        # ---- Greenhouse ----
+        if is_greenhouse_url(url):
+            result = extract_job_with_greenhouse(url)
+            if result and result.get("title"):
+                result["method"] = "greenhouse_dom"
+                rate_limiter.record_success(domain)
+                return {"success": True, "job": result}
+            return {"success": False, "error": "Greenhouse scrape failed", "url": url}
 
         # ---- Lever ----
         if is_lever_url(url):

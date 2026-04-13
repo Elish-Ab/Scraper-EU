@@ -12,7 +12,7 @@ os.makedirs("output", exist_ok=True)
 
 # ── Date range args ────────────────────────────────────────────────
 # Usage:
-#   python runner.py                          → last 5 days (default)
+#   python runner.py                          → last 2 days (default)
 #   python runner.py --from 2026-03-18 --to 2026-03-23
 #   python runner.py --days 7
 
@@ -32,11 +32,10 @@ days_str = get_arg("--days")
 if from_str:
     since_dt = datetime.fromisoformat(from_str).replace(tzinfo=timezone.utc)
     until_dt = datetime.fromisoformat(to_str).replace(tzinfo=timezone.utc) if to_str else datetime.now(timezone.utc)
-    # Calculate days from today back to --from date
-    DAYS = (datetime.now(timezone.utc) - since_dt).days + 1
+    DAYS     = (datetime.now(timezone.utc) - since_dt).days + 1
     print(f"📅 Date range: {from_str} → {to_str or 'today'} ({DAYS} days)")
 elif days_str:
-    DAYS    = int(days_str)
+    DAYS     = int(days_str)
     since_dt = None
     until_dt = None
     print(f"📅 Last {DAYS} days")
@@ -72,14 +71,10 @@ def in_date_range(job: dict) -> bool:
     pub = job.get("published") or job.get("posted", "")
     if not pub:
         return True  # no date → include
-
-    # Extract ISO date from pub string
     try:
-        # Handle "2026-03-19" or "2026-03-19T00:00:00.000Z"
         pub_date = datetime.fromisoformat(pub[:10]).replace(tzinfo=timezone.utc)
     except:
         return True
-
     if since_dt and pub_date < since_dt:
         return False
     if until_dt and pub_date > until_dt:
@@ -141,12 +136,17 @@ def scrape_board(board_url) -> list:
 
     return results
 
+
+# ── Main ───────────────────────────────────────────────────────────
+
 # Clear output file at start of run
 with open(OUTPUT_FILE, "w") as f:
     json.dump([], f)
 
-workable_boards = load_sources("workable_boards.json")
-lever_boards    = load_sources("lever_boards.json")
+workable_boards   = load_sources("workable_boards.json")
+lever_boards      = load_sources("lever_boards.json")
+ashby_boards      = load_sources("ashby_boards.json")
+greenhouse_boards = load_sources("greenhouse_boards.json")
 
 all_jobs = []
 
@@ -156,6 +156,14 @@ for board in workable_boards:
 
 print("\n=== LEVER ===")
 for board in lever_boards:
+    all_jobs.extend(scrape_board(board["url"]))
+
+print("\n=== ASHBY ===")
+for board in ashby_boards:
+    all_jobs.extend(scrape_board(board["url"]))
+
+print("\n=== GREENHOUSE ===")
+for board in greenhouse_boards:
     all_jobs.extend(scrape_board(board["url"]))
 
 print(f"\n✅ Total: {len(all_jobs)} jobs → {OUTPUT_FILE}")
@@ -169,11 +177,21 @@ if all_jobs:
     print("\n📊 Jobs by date:")
     for date in sorted(by_date.keys(), reverse=True):
         print(f"   {date}: {by_date[date]} jobs")
-        
-        
-# runner.py — add ashby boards
-ashby_boards = load_sources("ashby_boards.json")
 
-print("\n=== ASHBY ===")
-for board in ashby_boards:
-    all_jobs.extend(scrape_board(board["url"]))
+# Summary by platform
+if all_jobs:
+    by_platform = {}
+    for job in all_jobs:
+        url = job.get("url", "")
+        if "ashbyhq.com" in url:
+            platform = "Ashby"
+        elif "greenhouse.io" in url:
+            platform = "Greenhouse"
+        elif "lever.co" in url:
+            platform = "Lever"
+        else:
+            platform = "Workable"
+        by_platform[platform] = by_platform.get(platform, 0) + 1
+    print("\n📊 Jobs by platform:")
+    for platform, count in sorted(by_platform.items()):
+        print(f"   {platform}: {count} jobs")
