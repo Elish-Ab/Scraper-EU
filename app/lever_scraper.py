@@ -25,12 +25,28 @@ def is_lever_url(url: str) -> bool:
     return host.endswith("lever.co")
 
 
+def _lever_api_host(url: str) -> str:
+    """Return the correct Lever API host for a given board or job URL."""
+    host = urlparse(url).netloc.lower()
+    if "eu.lever.co" in host:
+        return "api.eu.lever.co"
+    return "api.lever.co"
+
+
+def _lever_board_base(url: str) -> str:
+    """Return the base jobs URL for a Lever board (EU or global)."""
+    host = urlparse(url).netloc.lower()
+    if "eu.lever.co" in host:
+        return "https://jobs.eu.lever.co"
+    return "https://jobs.lever.co"
+
+
 def parse_lever_board_url(board_url: str) -> str:
     parsed = urlparse(board_url)
     host   = parsed.netloc.lower()
     parts  = [p for p in parsed.path.strip("/").split("/") if p]
 
-    if host == "api.lever.co":
+    if host in ("api.lever.co", "api.eu.lever.co"):
         try:
             idx = parts.index("postings")
             return parts[idx + 1]
@@ -176,14 +192,14 @@ def _scrape_lever_board_dom(board_url: str) -> list:
 # API DATE FETCHER — always needed since DOM has no published date
 # ============================================================================
 
-def _fetch_lever_api_dates(company: str) -> dict:
+def _fetch_lever_api_dates(company: str, api_host: str = "api.lever.co") -> dict:
     """
     Fetch all Lever postings from public API and return
     {posting_id: {published, pub_date}} for date filtering.
 
     Lever's public API returns createdAt (Unix ms timestamp).
     """
-    api_url = f"https://api.lever.co/v0/postings/{company}?mode=json"
+    api_url = f"https://{api_host}/v0/postings/{company}?mode=json"
     headers = {
         "Accept": "application/json",
         "User-Agent": random.choice(USER_AGENTS),
@@ -245,6 +261,9 @@ def get_links_from_lever_api(board_url: str, since_dt: datetime = None, days: in
         logger.error(str(exc))
         return []
 
+    api_host   = _lever_api_host(board_url)
+    board_base = _lever_board_base(board_url)
+
     # Resolve since_dt from days fallback
     if since_dt is None and days is not None and days > 0:
         since_dt = datetime.now(timezone.utc) - timedelta(days=days)
@@ -253,7 +272,7 @@ def get_links_from_lever_api(board_url: str, since_dt: datetime = None, days: in
     dom_jobs = _scrape_lever_board_dom(board_url)
 
     # ── STEP 2: Always fetch API dates (Lever DOM never has published date) ─
-    api_date_map = _fetch_lever_api_dates(company)
+    api_date_map = _fetch_lever_api_dates(company, api_host)
 
     if dom_jobs:
         # ── STEP 3: Merge dates + filter ──────────────────────────────────
@@ -277,7 +296,7 @@ def get_links_from_lever_api(board_url: str, since_dt: datetime = None, days: in
 
     # ── STEP 4: API-only fallback ──────────────────────────────────────────
     logger.warning(f"   Lever DOM scrape failed → falling back to API-only for '{company}'")
-    return _get_links_from_lever_api_only(company, board_url, since_dt, api_date_map)
+    return _get_links_from_lever_api_only(company, board_url, since_dt, api_date_map, api_host, board_base)
 
 
 def _get_links_from_lever_api_only(
@@ -285,6 +304,8 @@ def _get_links_from_lever_api_only(
     board_url: str,
     since_dt: datetime,
     api_date_map: dict,
+    api_host: str = "api.lever.co",
+    board_base: str = "https://jobs.lever.co",
 ) -> list:
     """
     API-only fallback when DOM scrape fails.
@@ -295,7 +316,7 @@ def _get_links_from_lever_api_only(
     for job_id, info in api_date_map.items():
         if since_dt and info["pub_date"] < since_dt:
             continue
-        url = f"https://jobs.lever.co/{company}/{job_id}"
+        url = f"{board_base}/{company}/{job_id}"
         jobs.append({
             "url":       url,
             "jobId":     job_id,
@@ -306,7 +327,7 @@ def _get_links_from_lever_api_only(
     # If api_date_map was empty (e.g. both DOM and API failed), try full API
     if not jobs and not api_date_map:
         try:
-            api_url = f"https://api.lever.co/v0/postings/{company}?mode=json"
+            api_url = f"https://{api_host}/v0/postings/{company}?mode=json"
             headers = {"Accept": "application/json", "User-Agent": random.choice(USER_AGENTS)}
             resp    = requests.get(api_url, headers=headers, timeout=20)
             if resp.status_code == 200:
@@ -374,6 +395,11 @@ def extract_job_with_lever_api(job_url: str) -> dict | None:
     Step 3 — API-only fallback:
         If DOM scrape fails, use API + HTML fallback (original behaviour).
     """
+    # Strip /apply suffix — some boards link to the application form instead
+    # of the job detail page, which has no description in the DOM.
+    if job_url.rstrip("/").endswith("/apply"):
+        job_url = job_url.rstrip("/")[: -len("/apply")]
+
     try:
         company, posting_id = parse_lever_job_url(job_url)
     except ValueError as exc:
@@ -541,7 +567,8 @@ def _fetch_lever_job_api(company: str, posting_id: str, job_url: str) -> dict | 
     Primary use: get published date and country to enrich DOM result.
     Also used as full fallback if DOM fails.
     """
-    api_url = f"https://api.lever.co/v0/postings/{company}/{posting_id}?mode=json"
+    api_host = _lever_api_host(job_url)
+    api_url = f"https://{api_host}/v0/postings/{company}/{posting_id}?mode=json"
     headers = {
         "Accept": "application/json",
         "User-Agent": random.choice(USER_AGENTS),
