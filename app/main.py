@@ -21,6 +21,7 @@ from collections import defaultdict
 from app.lever_scraper import extract_job_with_lever_api, get_links_from_lever_api, is_lever_url
 from app.ashby_scraper import get_links_from_ashby, extract_job_with_ashby, is_ashby_url
 from app.greenhouse_scraper import get_links_from_greenhouse, extract_job_with_greenhouse, is_greenhouse_url
+from app.smartrecruiters_scraper import get_links_from_smartrecruiters, extract_job_with_smartrecruiters, is_smartrecruiters_url
 
 from app.checkpoint import (
     get_checkpoint,
@@ -1397,6 +1398,15 @@ def get_job_links(
         since_str = since_dt.isoformat() if since_dt else None
         logger.info(f"📅 Effective since_dt: {since_str}")
 
+        # ---- SmartRecruiters ----
+        if is_smartrecruiters_url(url):
+            jobs = get_links_from_smartrecruiters(url, since_dt=since_dt)
+            if jobs:
+                rate_limiter.record_success(domain)
+                _maybe_save_checkpoint(url, jobs, save_progress)
+                return {"success": True, "total": len(jobs), "jobs": jobs, "method": "smartrecruiters_api", "since": since_str}
+            return {"success": True, "total": 0, "jobs": [], "note": "No SmartRecruiters jobs found", "since": since_str}
+
         # ---- Ashby ----
         if is_ashby_url(url):
             jobs = get_links_from_ashby(url, since_dt=since_dt)
@@ -1499,6 +1509,15 @@ def get_job_details(url: str = Query(..., description="Workable, Lever, or Ashby
     try:
         domain = urlparse(url).netloc
         rate_limiter.wait_if_needed(domain)
+
+        # ---- SmartRecruiters ----
+        if is_smartrecruiters_url(url):
+            result = extract_job_with_smartrecruiters(url)
+            if result and result.get("title"):
+                result["method"] = "smartrecruiters_dom"
+                rate_limiter.record_success(domain)
+                return {"success": True, "job": result}
+            return {"success": False, "error": "SmartRecruiters scrape failed", "url": url}
 
         # ---- Ashby ----
         if is_ashby_url(url):
