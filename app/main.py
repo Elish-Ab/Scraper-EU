@@ -22,6 +22,7 @@ from app.lever_scraper import extract_job_with_lever_api, get_links_from_lever_a
 from app.ashby_scraper import get_links_from_ashby, extract_job_with_ashby, is_ashby_url
 from app.greenhouse_scraper import get_links_from_greenhouse, extract_job_with_greenhouse, is_greenhouse_url
 from app.smartrecruiters_scraper import get_links_from_smartrecruiters, extract_job_with_smartrecruiters, is_smartrecruiters_url
+from app.personio_scraper import get_links_from_personio, extract_job_with_personio, is_personio_url
 
 from app.checkpoint import (
     get_checkpoint,
@@ -1407,6 +1408,15 @@ def get_job_links(
                 return {"success": True, "total": len(jobs), "jobs": jobs, "method": "smartrecruiters_api", "since": since_str}
             return {"success": True, "total": 0, "jobs": [], "note": "No SmartRecruiters jobs found", "since": since_str}
 
+        # ---- Personio ----
+        if is_personio_url(url):
+            jobs = get_links_from_personio(url, since_dt=since_dt)
+            if jobs:
+                rate_limiter.record_success(domain)
+                _maybe_save_checkpoint(url, jobs, save_progress)
+                return {"success": True, "total": len(jobs), "jobs": jobs, "method": "personio_html", "since": since_str}
+            return {"success": True, "total": 0, "jobs": [], "note": "No Personio jobs found", "since": since_str}
+
         # ---- Ashby ----
         if is_ashby_url(url):
             jobs = get_links_from_ashby(url, since_dt=since_dt)
@@ -1518,6 +1528,15 @@ def get_job_details(url: str = Query(..., description="Workable, Lever, or Ashby
                 rate_limiter.record_success(domain)
                 return {"success": True, "job": result}
             return {"success": False, "error": "SmartRecruiters scrape failed", "url": url}
+
+        # ---- Personio ----
+        if is_personio_url(url):
+            result = extract_job_with_personio(url)
+            if result and result.get("title"):
+                result["method"] = "personio_dom"
+                rate_limiter.record_success(domain)
+                return {"success": True, "job": result}
+            return {"success": False, "error": "Personio scrape failed", "url": url}
 
         # ---- Ashby ----
         if is_ashby_url(url):
