@@ -23,6 +23,8 @@ from app.ashby_scraper import get_links_from_ashby, extract_job_with_ashby, is_a
 from app.greenhouse_scraper import get_links_from_greenhouse, extract_job_with_greenhouse, is_greenhouse_url
 from app.smartrecruiters_scraper import get_links_from_smartrecruiters, extract_job_with_smartrecruiters, is_smartrecruiters_url
 from app.personio_scraper import get_links_from_personio, extract_job_with_personio, is_personio_url
+from app.breezy_scraper import get_links_from_breezy, extract_job_with_breezy, is_breezy_url
+from app.bamboohr_scraper import get_links_from_bamboohr, extract_job_with_bamboohr, is_bamboohr_url
 
 from app.checkpoint import (
     get_checkpoint,
@@ -1399,6 +1401,24 @@ def get_job_links(
         since_str = since_dt.isoformat() if since_dt else None
         logger.info(f"📅 Effective since_dt: {since_str}")
 
+        # ---- BambooHR ----
+        if is_bamboohr_url(url):
+            jobs = get_links_from_bamboohr(url, since_dt=since_dt)
+            if jobs:
+                rate_limiter.record_success(domain)
+                _maybe_save_checkpoint(url, jobs, save_progress)
+                return {"success": True, "total": len(jobs), "jobs": jobs, "method": "bamboohr_api", "since": since_str}
+            return {"success": True, "total": 0, "jobs": [], "note": "No BambooHR jobs found", "since": since_str}
+
+        # ---- Breezy ----
+        if is_breezy_url(url):
+            jobs = get_links_from_breezy(url, since_dt=since_dt)
+            if jobs:
+                rate_limiter.record_success(domain)
+                _maybe_save_checkpoint(url, jobs, save_progress)
+                return {"success": True, "total": len(jobs), "jobs": jobs, "method": "breezy_html", "since": since_str}
+            return {"success": True, "total": 0, "jobs": [], "note": "No Breezy jobs found", "since": since_str}
+
         # ---- SmartRecruiters ----
         if is_smartrecruiters_url(url):
             jobs = get_links_from_smartrecruiters(url, since_dt=since_dt)
@@ -1519,6 +1539,24 @@ def get_job_details(url: str = Query(..., description="Workable, Lever, or Ashby
     try:
         domain = urlparse(url).netloc
         rate_limiter.wait_if_needed(domain)
+
+        # ---- BambooHR ----
+        if is_bamboohr_url(url):
+            result = extract_job_with_bamboohr(url)
+            if result and result.get("title"):
+                result["method"] = "bamboohr_api"
+                rate_limiter.record_success(domain)
+                return {"success": True, "job": result}
+            return {"success": False, "error": "BambooHR scrape failed", "url": url}
+
+        # ---- Breezy ----
+        if is_breezy_url(url):
+            result = extract_job_with_breezy(url)
+            if result and result.get("title"):
+                result["method"] = "breezy_html"
+                rate_limiter.record_success(domain)
+                return {"success": True, "job": result}
+            return {"success": False, "error": "Breezy scrape failed", "url": url}
 
         # ---- SmartRecruiters ----
         if is_smartrecruiters_url(url):
