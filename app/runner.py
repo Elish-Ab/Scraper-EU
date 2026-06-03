@@ -143,28 +143,51 @@ def scrape_board(board_url) -> list:
 with open(OUTPUT_FILE, "w") as f:
     json.dump([], f)
 
-workable_boards   = load_sources("workable_boards.json")
-lever_boards      = load_sources("lever_boards.json")
-ashby_boards      = load_sources("ashby_boards.json")
-greenhouse_boards = load_sources("greenhouse_boards.json")
+workable_boards        = load_sources("workable_boards.json")
+lever_boards           = load_sources("lever_boards.json")
+ashby_boards           = load_sources("ashby_boards.json")
+greenhouse_boards      = load_sources("greenhouse_boards.json")
+smartrecruiters_boards = load_sources("smartrecruiters_boards.json")
+personio_boards        = load_sources("personio_boards.json")
+breezy_boards          = load_sources("breezy_boards.json")
+bamboohr_boards        = load_sources("bamboohr_boards.json")
+
+def board_url(board) -> str:
+    return board["url"] if isinstance(board, dict) else board
 
 all_jobs = []
 
 print("\n=== WORKABLE ===")
 for board in workable_boards:
-    all_jobs.extend(scrape_board(board["url"]))
+    all_jobs.extend(scrape_board(board_url(board)))
 
 print("\n=== LEVER ===")
 for board in lever_boards:
-    all_jobs.extend(scrape_board(board["url"]))
+    all_jobs.extend(scrape_board(board_url(board)))
 
 print("\n=== ASHBY ===")
 for board in ashby_boards:
-    all_jobs.extend(scrape_board(board["url"]))
+    all_jobs.extend(scrape_board(board_url(board)))
 
 print("\n=== GREENHOUSE ===")
 for board in greenhouse_boards:
-    all_jobs.extend(scrape_board(board["url"]))
+    all_jobs.extend(scrape_board(board_url(board)))
+
+print("\n=== SMARTRECRUITERS ===")
+for board in smartrecruiters_boards:
+    all_jobs.extend(scrape_board(board_url(board)))
+
+print("\n=== PERSONIO ===")
+for board in personio_boards:
+    all_jobs.extend(scrape_board(board_url(board)))
+
+print("\n=== BREEZY ===")
+for board in breezy_boards:
+    all_jobs.extend(scrape_board(board_url(board)))
+
+print("\n=== BAMBOOHR ===")
+for board in bamboohr_boards:
+    all_jobs.extend(scrape_board(board_url(board)))
 
 print(f"\n✅ Total: {len(all_jobs)} jobs → {OUTPUT_FILE}")
 
@@ -189,6 +212,14 @@ if all_jobs:
             platform = "Greenhouse"
         elif "lever.co" in url:
             platform = "Lever"
+        elif "smartrecruiters.com" in url:
+            platform = "SmartRecruiters"
+        elif "personio" in url:
+            platform = "Personio"
+        elif "breezy.hr" in url:
+            platform = "Breezy"
+        elif "bamboohr.com" in url:
+            platform = "BambooHR"
         else:
             platform = "Workable"
         by_platform[platform] = by_platform.get(platform, 0) + 1
