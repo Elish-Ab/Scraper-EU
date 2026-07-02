@@ -4,8 +4,8 @@ import os
 import sys
 from datetime import datetime, timezone
 
-# API_BASE = "https://scraper-eu-production.up.railway.app"
-API_BASE = "http://localhost:8000"  # for local testing
+API_BASE = "https://scraper-eu-production.up.railway.app"
+#API_BASE = "http://localhost:8000"  # for local testing
 OUTPUT_FILE = "output/all_jobs.json"
 
 os.makedirs("output", exist_ok=True)
@@ -151,6 +151,7 @@ smartrecruiters_boards = load_sources("smartrecruiters_boards.json")
 personio_boards        = load_sources("personio_boards.json")
 breezy_boards          = load_sources("breezy_boards.json")
 bamboohr_boards        = load_sources("bamboohr_boards.json")
+pinpoint_boards        = load_sources("pinpoint_boards.json")
 
 def board_url(board) -> str:
     return board["url"] if isinstance(board, dict) else board
@@ -189,6 +190,10 @@ print("\n=== BAMBOOHR ===")
 for board in bamboohr_boards:
     all_jobs.extend(scrape_board(board_url(board)))
 
+print("\n=== PINPOINT ===")
+for board in pinpoint_boards:
+    all_jobs.extend(scrape_board(board_url(board)))
+
 print(f"\n✅ Total: {len(all_jobs)} jobs → {OUTPUT_FILE}")
 
 # Summary by date
@@ -220,6 +225,8 @@ if all_jobs:
             platform = "Breezy"
         elif "bamboohr.com" in url:
             platform = "BambooHR"
+        elif "pinpointhq.com" in url:
+            platform = "Pinpoint"
         else:
             platform = "Workable"
         by_platform[platform] = by_platform.get(platform, 0) + 1
