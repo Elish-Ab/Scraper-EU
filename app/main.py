@@ -28,6 +28,7 @@ from app.bamboohr_scraper import get_links_from_bamboohr, extract_job_with_bambo
 from app.pinpoint_scraper import get_links_from_pinpoint, extract_job_with_pinpoint, is_pinpoint_url
 from app.rippling_scraper import get_links_from_rippling, extract_job_with_rippling, is_rippling_url
 from app.teamtailor_scraper import get_links_from_teamtailor, extract_job_with_teamtailor, is_teamtailor_url
+from app.workday_scraper import get_links_from_workday, extract_job_with_workday, is_workday_url
 
 from app.checkpoint import (
     get_checkpoint,
@@ -1404,6 +1405,15 @@ def get_job_links(
         since_str = since_dt.isoformat() if since_dt else None
         logger.info(f"📅 Effective since_dt: {since_str}")
 
+        # ---- Workday ----
+        if is_workday_url(url):
+            jobs = get_links_from_workday(url, since_dt=since_dt)
+            if jobs:
+                rate_limiter.record_success(domain)
+                _maybe_save_checkpoint(url, jobs, save_progress)
+                return {"success": True, "total": len(jobs), "jobs": jobs, "method": "workday_api", "since": since_str}
+            return {"success": True, "total": 0, "jobs": [], "note": "No Workday jobs found", "since": since_str}
+
         # ---- TeamTailor ----
         if is_teamtailor_url(url):
             jobs = get_links_from_teamtailor(url, since_dt=since_dt)
@@ -1569,6 +1579,15 @@ def get_job_details(url: str = Query(..., description="Workable, Lever, or Ashby
     try:
         domain = urlparse(url).netloc
         rate_limiter.wait_if_needed(domain)
+
+        # ---- Workday ----
+        if is_workday_url(url):
+            result = extract_job_with_workday(url)
+            if result and result.get("title"):
+                result["method"] = "workday_ld_json"
+                rate_limiter.record_success(domain)
+                return {"success": True, "job": result}
+            return {"success": False, "error": "Workday scrape failed", "url": url}
 
         # ---- TeamTailor ----
         if is_teamtailor_url(url):
