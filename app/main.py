@@ -27,6 +27,7 @@ from app.breezy_scraper import get_links_from_breezy, extract_job_with_breezy, i
 from app.bamboohr_scraper import get_links_from_bamboohr, extract_job_with_bamboohr, is_bamboohr_url
 from app.pinpoint_scraper import get_links_from_pinpoint, extract_job_with_pinpoint, is_pinpoint_url
 from app.rippling_scraper import get_links_from_rippling, extract_job_with_rippling, is_rippling_url
+from app.teamtailor_scraper import get_links_from_teamtailor, extract_job_with_teamtailor, is_teamtailor_url
 
 from app.checkpoint import (
     get_checkpoint,
@@ -1403,6 +1404,15 @@ def get_job_links(
         since_str = since_dt.isoformat() if since_dt else None
         logger.info(f"📅 Effective since_dt: {since_str}")
 
+        # ---- TeamTailor ----
+        if is_teamtailor_url(url):
+            jobs = get_links_from_teamtailor(url, since_dt=since_dt)
+            if jobs:
+                rate_limiter.record_success(domain)
+                _maybe_save_checkpoint(url, jobs, save_progress)
+                return {"success": True, "total": len(jobs), "jobs": jobs, "method": "teamtailor_feed", "since": since_str}
+            return {"success": True, "total": 0, "jobs": [], "note": "No TeamTailor jobs found", "since": since_str}
+
         # ---- Rippling ----
         if is_rippling_url(url):
             jobs = get_links_from_rippling(url, since_dt=since_dt)
@@ -1559,6 +1569,15 @@ def get_job_details(url: str = Query(..., description="Workable, Lever, or Ashby
     try:
         domain = urlparse(url).netloc
         rate_limiter.wait_if_needed(domain)
+
+        # ---- TeamTailor ----
+        if is_teamtailor_url(url):
+            result = extract_job_with_teamtailor(url)
+            if result and result.get("title"):
+                result["method"] = "teamtailor_html"
+                rate_limiter.record_success(domain)
+                return {"success": True, "job": result}
+            return {"success": False, "error": "TeamTailor scrape failed", "url": url}
 
         # ---- Rippling ----
         if is_rippling_url(url):

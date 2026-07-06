@@ -153,6 +153,7 @@ breezy_boards          = load_sources("breezy_boards.json")
 bamboohr_boards        = load_sources("bamboohr_boards.json")
 pinpoint_boards        = load_sources("pinpoint_boards.json")
 rippling_boards        = load_sources("rippling_boards.json")
+teamtailor_boards      = load_sources("teamtailor_boards.json")
 
 def board_url(board) -> str:
     return board["url"] if isinstance(board, dict) else board
@@ -199,6 +200,10 @@ print("\n=== RIPPLING ===")
 for board in rippling_boards:
     all_jobs.extend(scrape_board(board_url(board)))
 
+print("\n=== TEAMTAILOR ===")
+for board in teamtailor_boards:
+    all_jobs.extend(scrape_board(board_url(board)))
+
 print(f"\n✅ Total: {len(all_jobs)} jobs → {OUTPUT_FILE}")
 
 # Summary by date
@@ -234,6 +239,8 @@ if all_jobs:
             platform = "Pinpoint"
         elif "rippling.com" in url:
             platform = "Rippling"
+        elif "teamtailor.com" in url:
+            platform = "TeamTailor"
         else:
             platform = "Workable"
         by_platform[platform] = by_platform.get(platform, 0) + 1
