@@ -2,7 +2,7 @@ import json
 import requests
 import os
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 API_BASE = "https://scraper-eu-production.up.railway.app"
 #API_BASE = "http://localhost:8000"  # for local testing
@@ -36,12 +36,12 @@ if from_str:
     print(f"📅 Date range: {from_str} → {to_str or 'today'} ({DAYS} days)")
 elif days_str:
     DAYS     = int(days_str)
-    since_dt = None
+    since_dt = datetime.now(timezone.utc) - timedelta(days=DAYS)
     until_dt = None
     print(f"📅 Last {DAYS} days")
 else:
     DAYS     = 2
-    since_dt = None
+    since_dt = datetime.now(timezone.utc) - timedelta(days=DAYS)
     until_dt = None
     print(f"📅 Default: last {DAYS} days")
 
