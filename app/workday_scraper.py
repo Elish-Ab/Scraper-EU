@@ -242,8 +242,8 @@ def extract_job_with_workday(job_url: str) -> dict | None:
     # ── Company ───────────────────────────────────────────────────────────
     org = ld.get("hiringOrganization") or {}
     org_name = (org.get("name") or "").strip()
-    # Strip Workday legal-entity prefix like "LE-6300 "
-    org_name = re.sub(r"^[A-Z]{2}-\d+\s+", "", org_name)
+    # Strip Workday legal-entity prefix like "LE-6300 " or "8460 "
+    org_name = re.sub(r"^([A-Z]{2}-\d+|\d+)\s+", "", org_name)
     if org_name:
         job["company"] = org_name
 
