@@ -3,6 +3,7 @@ from datetime import datetime, timezone
 from urllib.parse import urlparse
 import logging
 import random
+import re
 import requests
 import json
 from bs4 import BeautifulSoup
@@ -50,6 +51,10 @@ query ApiJobBoardWithTeams($organizationHostedJobsPageName: String!) {
 # ============================================================================
 # URL HELPERS
 # ============================================================================
+
+def _company_name_from_slug(slug: str) -> str:
+    return " ".join(w.capitalize() for w in re.split(r"[-_]+", slug) if w)
+
 
 def is_ashby_url(url: str) -> bool:
     host = urlparse(url).netloc.lower()
@@ -395,6 +400,7 @@ def extract_job_with_ashby(job_url: str) -> dict | None:
                     "jobId":   job_id,
                     "url":     job_url,
                     "account": company,
+                    "company": _company_name_from_slug(company),
                 }
 
                 # Title

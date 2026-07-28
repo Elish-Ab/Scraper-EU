@@ -4,6 +4,7 @@ from urllib.parse import urlparse
 import json
 import logging
 import random
+import re
 import requests
 from bs4 import BeautifulSoup
 
@@ -40,6 +41,11 @@ def _slug_from_url(url: str) -> str | None:
     """Extract company slug from e.g. https://ats.rippling.com/prisma-careers/jobs"""
     parts = [p for p in urlparse(url).path.strip("/").split("/") if p]
     return parts[0] if parts else None
+
+
+def _company_name_from_slug(slug: str) -> str:
+    slug = re.sub(r"-careers$", "", slug, flags=re.IGNORECASE)
+    return " ".join(w.capitalize() for w in re.split(r"[-_]+", slug) if w)
 
 
 def _job_id_from_path(path: str) -> str | None:
@@ -202,10 +208,12 @@ def extract_job_with_rippling(job_url: str) -> dict | None:
     if not title:
         return None
 
+    slug = _slug_from_url(job_url)
     job: dict = {
         "jobId": job_post.get("uuid") or job_id,
         "url": job_post.get("url") or job_url,
         "title": title,
+        "company": _company_name_from_slug(slug) if slug else None,
     }
 
     # Department

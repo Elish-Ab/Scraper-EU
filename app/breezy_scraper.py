@@ -30,6 +30,11 @@ def _base_url(url: str) -> str:
     return f"{p.scheme}://{p.netloc}"
 
 
+def _company_name_from_host(netloc: str) -> str:
+    slug = netloc.split(".")[0]
+    return " ".join(w.capitalize() for w in re.split(r"[-_]+", slug) if w)
+
+
 def _job_id_from_path(path: str) -> str | None:
     """Extract job ID from a Breezy path like /p/25c7b9d48869-qa-test-engineer."""
     parts = [p for p in path.strip("/").split("/") if p]
@@ -234,6 +239,7 @@ def extract_job_with_breezy(job_url: str) -> dict | None:
         "jobId": job_id,
         "url":   clean_url,
         "title": title,
+        "company": _company_name_from_host(parsed.netloc),
     }
 
     # ── Meta (location, type, department, remote) ──────────────────────────

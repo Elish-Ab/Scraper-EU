@@ -3,6 +3,7 @@ from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse, urljoin
 import logging
 import random
+import re
 import time
 import requests
 from bs4 import BeautifulSoup
@@ -19,6 +20,10 @@ USER_AGENTS = [
 # ============================================================================
 # URL HELPERS
 # ============================================================================
+
+def _company_name_from_slug(slug: str) -> str:
+    return " ".join(w.capitalize() for w in re.split(r"[-_]+", slug) if w)
+
 
 def is_lever_url(url: str) -> bool:
     host = urlparse(url).netloc.lower()
@@ -484,6 +489,7 @@ def _scrape_lever_detail_dom(job_url: str, company: str, posting_id: str) -> dic
         "jobId":   posting_id,
         "url":     job_url,
         "account": company,
+        "company": _company_name_from_slug(company),
         "title":   title,
     }
 
@@ -590,6 +596,7 @@ def _fetch_lever_job_api(company: str, posting_id: str, job_url: str) -> dict | 
             "jobId":            data.get("id") or posting_id,
             "url":              data.get("hostedUrl") or job_url,
             "account":          company,
+            "company":          _company_name_from_slug(company),
             "title":            data.get("text"),
             "department":       cats.get("team"),
             "published":        created_dt.isoformat() if created_dt else "",

@@ -3,6 +3,7 @@ from datetime import datetime, timezone
 from urllib.parse import urlparse
 import logging
 import random
+import re
 import requests
 
 logger = logging.getLogger(__name__)
@@ -33,6 +34,11 @@ def is_bamboohr_url(url: str) -> bool:
 def _base_url(url: str) -> str:
     p = urlparse(url)
     return f"{p.scheme}://{p.netloc}"
+
+
+def _company_name_from_host(netloc: str) -> str:
+    slug = netloc.split(".")[0]
+    return " ".join(w.capitalize() for w in re.split(r"[-_]+", slug) if w)
 
 
 def _job_id_from_path(path: str) -> str | None:
@@ -184,6 +190,7 @@ def extract_job_with_bamboohr(job_url: str) -> dict | None:
         "jobId": job_id,
         "url":   jo.get("jobOpeningShareUrl") or f"{base}/careers/{job_id}",
         "title": title,
+        "company": _company_name_from_host(parsed.netloc),
     }
 
     if jo.get("datePosted"):
