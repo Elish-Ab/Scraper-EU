@@ -256,6 +256,18 @@ def extract_job_with_teamtailor(job_url: str) -> dict | None:
         except Exception as e:
             logger.debug(f"   TeamTailor LD+JSON parse error: {e}")
 
+    # ── Company website ─────────────────────────────────────────────────────
+    # LD+JSON hiringOrganization.sameAs just points back to the TeamTailor-
+    # hosted board itself, not the real company site. The genuine site is
+    # linked from the header/footer, labeled "Homepage".
+    homepage_span = soup.find("span", string=lambda s: bool(s and s.strip() == "Homepage"))
+    if homepage_span:
+        link = homepage_span.find_next("a", href=True)
+        if link:
+            href = link["href"].strip()
+            if href.startswith("http"):
+                job["company_website"] = href
+
     # ── Metadata spans (department, visible location, workplace) ──────────
     # The first metadata div has: dept · location · workplace
     meta_spans = [

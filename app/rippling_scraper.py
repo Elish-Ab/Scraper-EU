@@ -208,12 +208,17 @@ def extract_job_with_rippling(job_url: str) -> dict | None:
     if not title:
         return None
 
-    slug = _slug_from_url(job_url)
+    # jobBoard.companyName is the real registered company name (e.g. "Prisma
+    # Data, Inc.") — prefer it over the URL-slug guess. No website field
+    # exists anywhere in Rippling's apiData.
+    job_board    = api_data.get("jobBoard") or {}
+    company_name = (job_board.get("companyName") or "").strip()
+    slug         = _slug_from_url(job_url)
     job: dict = {
         "jobId": job_post.get("uuid") or job_id,
         "url": job_post.get("url") or job_url,
         "title": title,
-        "company": _company_name_from_slug(slug) if slug else None,
+        "company": company_name or (_company_name_from_slug(slug) if slug else None),
     }
 
     # Department

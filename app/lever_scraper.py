@@ -563,6 +563,17 @@ def _scrape_lever_detail_dom(job_url: str, company: str, posting_id: str) -> dic
         if apply_href:
             job["apply_url"] = apply_href
 
+    # ── Company website ─────────────────────────────────────────────────────
+    # div.main-footer-text holds a "{Company} Home Page" link plus a
+    # "Jobs powered by Lever" link — take the one that isn't lever.co.
+    footer = soup.select_one("div.main-footer-text")
+    if footer:
+        for a in footer.select("a[href]"):
+            href = a.get("href", "").strip()
+            if href.startswith("http") and "lever.co" not in href:
+                job["company_website"] = href
+                break
+
     has_content = bool(job.get("description") or job.get("requirements") or job.get("location"))
     return job if has_content else None
 

@@ -356,5 +356,24 @@ def extract_job_with_personio(job_url: str) -> dict | None:
         if href:
             job["apply_url"] = urljoin(base, href)
 
+    # ── Company website ─────────────────────────────────────────────────────
+    # Personio pages have no dedicated "company site" element, but boards
+    # for EU (mostly German) companies link out to a legal notice page
+    # (Impressum/Imprint) hosted on the company's real domain. Only trust
+    # it when there's exactly one distinct external, non-social domain on
+    # the page — ambiguous cases are left unset rather than guessed.
+    _SOCIAL_HOSTS = ("facebook.", "linkedin.", "twitter.", "x.com", "instagram.",
+                     "youtube.", "xing.", "tiktok.")
+    external_domains = set()
+    for a in soup.select("a[href^='http']"):
+        href_host = urlparse(a["href"]).netloc.lower()
+        if not href_host or "personio." in href_host:
+            continue
+        if any(s in href_host for s in _SOCIAL_HOSTS):
+            continue
+        external_domains.add(f"{urlparse(a['href']).scheme}://{href_host}")
+    if len(external_domains) == 1:
+        job["company_website"] = next(iter(external_domains))
+
     has_content = bool(job.get("description") or job.get("requirements") or job.get("location"))
     return job if has_content else None

@@ -224,6 +224,15 @@ def extract_job_with_pinpoint(job_url: str) -> dict | None:
                 if value:
                     job[field] = value
 
+    # ── Company website ─────────────────────────────────────────────────────
+    # First external footer link is the company's real homepage; the
+    # privacy-policy link right after it is always a relative path.
+    site_link = soup.select_one("a.external-footer__link[href^='http']")
+    if site_link:
+        href = site_link.get("href", "").strip()
+        if href:
+            job["company_website"] = href
+
     # ── Description — combine all named content sections ──────────────────
     section_ids = [
         "about-body",

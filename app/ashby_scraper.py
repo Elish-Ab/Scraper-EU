@@ -396,12 +396,28 @@ def extract_job_with_ashby(job_url: str) -> dict | None:
                     pass
                 page.wait_for_timeout(1000)
 
+                # window.__appData (still present in rendered HTML) carries
+                # organization.name and organization.publicWebsite — the real
+                # company name/site, better than the URL-slug guess.
+                org_name    = None
+                org_website = None
+                try:
+                    app_data = _extract_app_data(page.content())
+                    if app_data:
+                        org = app_data.get("organization") or {}
+                        org_name    = (org.get("name") or "").strip() or None
+                        org_website = (org.get("publicWebsite") or "").strip() or None
+                except Exception:
+                    pass
+
                 job_data = {
                     "jobId":   job_id,
                     "url":     job_url,
                     "account": company,
-                    "company": _company_name_from_slug(company),
+                    "company": org_name or _company_name_from_slug(company),
                 }
+                if org_website:
+                    job_data["company_website"] = org_website
 
                 # Title
                 try:
